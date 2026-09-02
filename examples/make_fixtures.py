@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -94,9 +93,15 @@ def generate(
     start: dt.datetime | None = None,
     clean: bool = True,
 ) -> list[Path]:
-    if clean and output.exists():
-        shutil.rmtree(output)
+    # Empty the directory rather than removing it.  It is bind-mounted into
+    # the LocalStack container, and deleting the directory a running container
+    # has mounted leaves that mount pointing at a path that no longer exists --
+    # the container then sees an empty directory and seeding silently does
+    # nothing.  Removing only the files keeps the mount valid.
     output.mkdir(parents=True, exist_ok=True)
+    if clean:
+        for stale in output.glob("*.tif"):
+            stale.unlink()
 
     start = start or dt.datetime(2024, 3, 1, 10, 40, 21)
     written: list[Path] = []

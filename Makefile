@@ -78,7 +78,8 @@ down:  ## Stop the stack, keeping volumes
 clean-volumes:  ## Stop the stack and delete all data (catalogs, database, S3)
 	$(COMPOSE) --profile all down -v
 
-seed-s3: fixtures  ## Re-upload fixtures to LocalStack after regenerating them
+seed-s3:  ## Re-upload fixtures to LocalStack after regenerating them
+	@ls fixtures/tiles/*.tif >/dev/null 2>&1 || { echo "No granules -- run 'make fixtures' first"; exit 1; }
 	$(COMPOSE) exec localstack bash /etc/localstack/init/ready.d/01-seed-s3.sh
 
 verify-s3:  ## Check LocalStack serves granules anonymously with range requests
