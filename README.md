@@ -273,6 +273,10 @@ Generation is **additive** — nothing is deleted without `--prune`.
 `make fixtures-add DATES=2` appends two more dates after the newest existing
 one, so you can watch the mosaic grow across re-harvests.
 
+`make fixtures-scatter SCATTER=8 DATES=4` places granules at random points
+instead of tiling a grid, giving a sparse mosaic with gaps and overlaps spread
+across a wide extent. Placement is seeded per date, so it is reproducible.
+
 **The one gotcha**: the driver runs on your machine, but the granule URLs and
 database host it sends are resolved by *GeoServer*, inside the compose network.
 They default to compose service names (`postgis`, `localstack`) for that reason.

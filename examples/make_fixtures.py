@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import random
 import re
 from pathlib import Path
 
@@ -52,20 +53,46 @@ EPOCH = dt.datetime(2024, 3, 1, 10, 40, 21)
 #: Days between consecutive time steps.
 INTERVAL_DAYS = 5
 
-#: Filenames look like S2_20240301T104021_r0c0.tif.
-NAME_RE = re.compile(r"S2_(\d{8}T\d{6})_r(\d+)c(\d+)\.tif$")
+#: Filenames look like S2_20240301T104021_r0c0.tif (grid) or
+#: S2_20240301T104021_p03.tif (scatter).
+NAME_RE = re.compile(r"S2_(\d{8}T\d{6})_([a-z0-9]+)\.tif$")
+
+#: Default size of a scattered granule, in degrees.
+TILE_DEGREES = 1.0
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "fixtures" / "tiles"
 
 
-def tile_bounds(grid: int, row: int, col: int) -> tuple[float, float, float, float]:
+def tile_bounds(
+    grid: int,
+    row: int,
+    col: int,
+    extent: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float]:
     """Bounds of one cell in a ``grid`` x ``grid`` subdivision of the extent."""
-    width = (EAST - WEST) / grid
-    height = (NORTH - SOUTH) / grid
-    west = WEST + col * width
+    west_, south_, east_, north_ = extent or (WEST, SOUTH, EAST, NORTH)
+    width = (east_ - west_) / grid
+    height = (north_ - south_) / grid
+    west = west_ + col * width
     # Row 0 is the northern row, matching raster row order.
-    north = NORTH - row * height
+    north = north_ - row * height
     return (west, north - height, west + width, north)
+
+
+def scatter_bounds(
+    rng: random.Random,
+    tile_deg: float,
+    extent: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """A random tile-sized box inside ``extent``.
+
+    Granules may overlap or leave gaps, which is the point: a mosaic of
+    scattered footprints exercises the reader far more than a neat tiling.
+    """
+    west, south, east, north = extent
+    left = rng.uniform(west, max(west, east - tile_deg))
+    bottom = rng.uniform(south, max(south, north - tile_deg))
+    return (left, bottom, left + tile_deg, bottom + tile_deg)
 
 
 def step_index(when: dt.datetime) -> int:
@@ -90,7 +117,7 @@ def _hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
     return np.stack([r, g, b])
 
 
-def tile_pixels(size: int, row: int, col: int, step: int, bands: int = 3) -> np.ndarray:
+def tile_pixels(size: int, shade: int, step: int, bands: int = 3) -> np.ndarray:
     """Render a pattern that identifies both the tile and its time step.
 
     Colour is one hue per time step, so every tile of a given date belongs to
@@ -109,9 +136,9 @@ def tile_pixels(size: int, row: int, col: int, step: int, bands: int = 3) -> np.
     y, x = np.mgrid[0:size, 0:size].astype(np.float32) / max(size - 1, 1)
     hue = np.full((size, size), (0.61803398875 * step) % 1.0, dtype=np.float32)
     saturation = 0.40 + 0.50 * x
-    # A slight per-tile shade so a duplicated or misplaced granule is spottable,
+    # A slight per-granule shade so a duplicated or misplaced one is spottable,
     # small enough that the date still reads as one colour.
-    value = 0.55 + 0.40 * (1.0 - y) - 0.06 * (row + col)
+    value = 0.55 + 0.40 * (1.0 - y) - 0.06 * (shade % 4)
     data = (_hsv_to_rgb(hue, saturation, value) * 255).clip(0, 255).astype(np.uint8)
     if bands != 3:
         data = np.repeat(data[:1], bands, axis=0)
@@ -165,6 +192,10 @@ def generate(
     output: Path,
     *,
     grid: int = 2,
+    scatter: int = 0,
+    tile_deg: float = TILE_DEGREES,
+    extent: tuple[float, float, float, float] | None = None,
+    seed: int = 0,
     dates: int = 3,
     size: int = 512,
     start: dt.datetime | None = None,
@@ -192,16 +223,37 @@ def generate(
             existing[-1] + dt.timedelta(days=INTERVAL_DAYS) if existing else EPOCH
         )
 
+    extent = extent or (WEST, SOUTH, EAST, NORTH)
+
     written: list[Path] = []
     for phase in range(dates):
         when = start + dt.timedelta(days=INTERVAL_DAYS * phase)
         stamp = when.strftime(TIMESTAMP_FORMAT)
         step = step_index(when)
-        for row in range(grid):
-            for col in range(grid):
-                path = output / f"S2_{stamp}_r{row}c{col}.tif"
-                write_cog(path, tile_pixels(size, row, col, step), tile_bounds(grid, row, col))
+
+        if scatter:
+            # Seeded per date, so a given date always lands in the same places
+            # however often it is regenerated -- and appended dates land
+            # somewhere new rather than retracing the first batch.
+            rng = random.Random(f"{seed}:{step}")
+            for n in range(scatter):
+                path = output / f"S2_{stamp}_p{n:02d}.tif"
+                write_cog(
+                    path,
+                    tile_pixels(size, n, step),
+                    scatter_bounds(rng, tile_deg, extent),
+                )
                 written.append(path)
+        else:
+            for row in range(grid):
+                for col in range(grid):
+                    path = output / f"S2_{stamp}_r{row}c{col}.tif"
+                    write_cog(
+                        path,
+                        tile_pixels(size, row + col, step),
+                        tile_bounds(grid, row, col, extent),
+                    )
+                    written.append(path)
 
     if prune:
         # Opt-in only.  Granules outside the set just written -- typically left
@@ -213,6 +265,22 @@ def generate(
                 stale.unlink()
                 pruned.append(stale.name)
     return written
+
+
+def covered_extent(paths: list[Path]) -> tuple[float, float, float, float] | None:
+    """Union of the granules' bounds, for use as a WMS bbox."""
+    boxes = []
+    for path in paths:
+        with rasterio.open(path) as dataset:
+            boxes.append(dataset.bounds)
+    if not boxes:
+        return None
+    return (
+        min(b.left for b in boxes),
+        min(b.bottom for b in boxes),
+        max(b.right for b in boxes),
+        max(b.top for b in boxes),
+    )
 
 
 def parse_start(value: str) -> dt.datetime:
@@ -231,7 +299,32 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--grid", type=int, default=2, help="tiles per axis")
+    parser.add_argument("--grid", type=int, default=2, help="tiles per axis (grid layout)")
+    parser.add_argument(
+        "--scatter",
+        type=int,
+        metavar="N",
+        default=0,
+        help="place N granules at random points per date instead of tiling a "
+        "grid, so the mosaic is sparse and spread out",
+    )
+    parser.add_argument(
+        "--tile-deg",
+        type=float,
+        default=TILE_DEGREES,
+        help=f"size of a scattered granule in degrees (default {TILE_DEGREES})",
+    )
+    parser.add_argument(
+        "--extent",
+        type=float,
+        nargs=4,
+        metavar=("W", "S", "E", "N"),
+        default=[WEST, SOUTH, EAST, NORTH],
+        help="region the granules cover or are scattered within",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="RNG seed for --scatter placement"
+    )
     parser.add_argument("--dates", type=int, default=3, help="number of timestamps")
     parser.add_argument("--size", type=int, default=512, help="pixels per tile axis")
     parser.add_argument(
@@ -256,6 +349,10 @@ def main() -> None:
     written = generate(
         args.output,
         grid=args.grid,
+        scatter=args.scatter,
+        tile_deg=args.tile_deg,
+        extent=tuple(args.extent),
+        seed=args.seed,
         dates=args.dates,
         size=args.size,
         start=args.start,
@@ -280,6 +377,10 @@ def main() -> None:
     size_kib = sum(path.stat().st_size for path in total) / 1024
     print(f"  directory now holds {len(total)} granule(s), {size_kib:.0f} KiB")
     print(f"  time steps: {', '.join(s.strftime('%Y-%m-%d') for s in stamps)}")
+    covered = covered_extent(total)
+    if covered:
+        west, south, east, north = covered
+        print(f"  extent: {west:.2f},{south:.2f},{east:.2f},{north:.2f}")
     if not args.prune:
         print("  (additive -- delete files yourself, or pass --prune)")
 

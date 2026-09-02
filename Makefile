@@ -27,6 +27,10 @@ WHICH    ?= remote
 # How many time steps `make fixtures-add` appends.
 DATES    ?= 1
 
+# Granules per date, and the region they land in, for `make fixtures-scatter`.
+SCATTER  ?= 8
+EXTENT   ?= 5 40 25 55
+
 GEOSERVER_USER     ?= admin
 GEOSERVER_PASSWORD ?= geoserver
 
@@ -38,7 +42,7 @@ COMPOSE   = docker compose
 UV        = uv run --extra dev --extra examples
 
 .PHONY: help install test fixtures up up-gs3 up-all down clean-volumes logs ps \
-        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui fixtures-add
+        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui fixtures-add fixtures-scatter
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -55,6 +59,10 @@ test:  ## Run the unit tests (no stack required)
 
 fixtures:  ## Generate the base demo COG granules into fixtures/tiles
 	$(UV) python examples/make_fixtures.py
+
+fixtures-scatter:  ## Scatter granules at random points: make fixtures-scatter SCATTER=8 DATES=4
+	$(UV) python examples/make_fixtures.py --scatter $(SCATTER) --dates $(DATES) --extent $(EXTENT)
+	@echo "Re-seed with 'make seed-s3', then re-harvest with 'make mosaic'."
 
 fixtures-add:  ## Append DATES more time steps, then re-seed: make fixtures-add DATES=2
 	$(UV) python examples/make_fixtures.py --append --dates $(DATES)

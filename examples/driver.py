@@ -200,9 +200,35 @@ BUILDERS = {
 # ---------------------------------------------------------------------------
 
 
-def wms_url(settings: Settings, layer: str, *, time: str | None = None) -> str:
+def layer_bbox(
+    client: GeoServerClient, workspace: str, store: str, coverage: str
+) -> tuple[float, float, float, float]:
+    """The coverage's own lat/lon extent, falling back to the demo box.
+
+    Scattered granules cover far more ground than the tidy grid does, so a
+    hardcoded bbox would frame the preview on empty space.
+    """
+    try:
+        box = client.get_coverage(workspace, store, coverage).get("latLonBoundingBox")
+        if box:
+            return (
+                float(box["minx"]), float(box["miny"]),
+                float(box["maxx"]), float(box["maxy"]),
+            )
+    except (GeoServerError, KeyError, TypeError, ValueError):
+        pass
+    return DEMO_BBOX
+
+
+def wms_url(
+    settings: Settings,
+    layer: str,
+    *,
+    time: str | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> str:
     """A GetMap URL, so the result can be eyeballed in a browser."""
-    west, south, east, north = DEMO_BBOX
+    west, south, east, north = bbox or DEMO_BBOX
     params = {
         "service": "WMS",
         "version": "1.1.1",
@@ -264,10 +290,13 @@ def report(settings: Settings, manager: MosaicManager, result: MosaicResult) -> 
     # One URL per time step: the default preview shows a single slice (the
     # newest), so without these it is easy to conclude the extra granules did
     # not land when they are simply at another date.
-    print(f"  default    {wms_url(settings, result.layer)}")
+    box = layer_bbox(manager.client, result.workspace, result.store, result.coverage)
+    pad = max((box[2] - box[0]), (box[3] - box[1])) * 0.05
+    box = (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
+    print(f"  extent     {box[0]:.2f},{box[1]:.2f},{box[2]:.2f},{box[3]:.2f}")
+    print(f"  default    {wms_url(settings, result.layer, bbox=box)}")
     for stamp in times:
-        label = stamp[:10]
-        print(f"  {label} {wms_url(settings, result.layer, time=stamp)}")
+        print(f"  {stamp[:10]} {wms_url(settings, result.layer, time=stamp, bbox=box)}")
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +368,8 @@ def cmd_inspect(client: GeoServerClient, settings: Settings, args) -> int:
             print(f"  {key:<15} {info[key]}")
         if info["coverage_exists"]:
             layer = f"{WORKSPACE}:{info['coverage']}"
-            print(f"  {'preview':<15} {wms_url(settings, layer)}")
+            box = layer_bbox(client, WORKSPACE, info["store"], info["coverage"])
+            print(f"  {'preview':<15} {wms_url(settings, layer, bbox=box)}")
     return 0
 
 

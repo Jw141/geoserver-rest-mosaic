@@ -125,6 +125,27 @@ resolves `localhost` to its own container.
 marker squares along the top edge, one per time step, so a WMS preview at
 different `time=` values is unmistakably different.
 
+### Layouts
+
+`--grid` (default) tiles the extent neatly. `--scatter N` places N granules per
+date at random points instead, so the mosaic is sparse and spread out — gaps,
+overlaps and empty space, which exercises the reader far more than a tidy
+tiling:
+
+```bash
+make fixtures-scatter SCATTER=8 DATES=4        # 8 granules per date, 4 dates
+make fixtures-scatter SCATTER=12 DATES=6 EXTENT="0 35 30 60"
+```
+
+Placement is seeded per date, so a date always lands in the same places however
+often it is regenerated, and appended dates land somewhere new rather than
+retracing the first batch. `--seed` picks a different arrangement, `--tile-deg`
+sets granule size, and `--extent W S E N` the region they scatter within.
+
+Both the generator and the driver report the covered extent, and the driver's
+preview URLs use the layer's own bounding box — a hardcoded one would frame
+scattered granules on empty space.
+
 **More granules do not make a bigger picture.** Appending dates adds *time
 steps*, not area — the mosaic stays a 2x2 grid covering the same extent, and the
 preview shows **one slice at a time** (the newest, per the `MAXIMUM` default
