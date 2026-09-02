@@ -125,6 +125,14 @@ resolves `localhost` to its own container.
 marker squares along the top edge, one per time step, so a WMS preview at
 different `time=` values is unmistakably different.
 
+**More granules do not make a bigger picture.** Appending dates adds *time
+steps*, not area — the mosaic stays a 2x2 grid covering the same extent, and the
+preview shows **one slice at a time** (the newest, per the `MAXIMUM` default
+strategy). 24 files is 6 dates x 4 tiles, and each preview shows 4 of them. To
+see the others, pass `time=` — the driver prints a URL per time step, and the
+layer preview has a time selector. The marker squares along the top edge count
+the time step, so you can tell slices apart at a glance.
+
 **Generation is additive.** Nothing is deleted unless you pass `--prune`; delete
 files yourself when you are ready. To watch the mosaic grow, append time steps
 and re-harvest:

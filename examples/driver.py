@@ -261,9 +261,13 @@ def report(settings: Settings, manager: MosaicManager, result: MosaicResult) -> 
     )
     if times:
         print(f"  times      {', '.join(times)}")
-    print(f"  preview    {wms_url(settings, result.layer)}")
-    if times:
-        print(f"  at t[0]    {wms_url(settings, result.layer, time=times[0])}")
+    # One URL per time step: the default preview shows a single slice (the
+    # newest), so without these it is easy to conclude the extra granules did
+    # not land when they are simply at another date.
+    print(f"  default    {wms_url(settings, result.layer)}")
+    for stamp in times:
+        label = stamp[:10]
+        print(f"  {label} {wms_url(settings, result.layer, time=stamp)}")
 
 
 # ---------------------------------------------------------------------------

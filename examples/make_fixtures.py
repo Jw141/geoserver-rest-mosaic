@@ -78,28 +78,50 @@ def step_index(when: dt.datetime) -> int:
     return round((when - EPOCH).total_seconds() / (INTERVAL_DAYS * 86400))
 
 
+def _hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Vectorised HSV -> RGB, all channels in [0, 1]."""
+    i = np.floor(h * 6).astype(int) % 6
+    f = h * 6 - np.floor(h * 6)
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    conds = [i == n for n in range(6)]
+    r = np.select(conds, [v, q, p, p, t, v])
+    g = np.select(conds, [t, v, v, q, p, p])
+    b = np.select(conds, [p, p, t, v, v, q])
+    return np.stack([r, g, b])
+
+
 def tile_pixels(size: int, row: int, col: int, step: int, bands: int = 3) -> np.ndarray:
     """Render a pattern that identifies both the tile and its time step.
 
-    The gradient shows the tile's position within the grid, the colour shifts
-    per time step, and a run of marker squares along the top edge counts the
-    step out explicitly -- so a WMS preview at two different ``time=`` values is
-    unmistakably different rather than subtly so.
+    Colour is one hue per time step, so every tile of a given date belongs to
+    the same colour family and a single time slice reads as one coherent image.
+    Hues are spaced by the golden angle, which keeps consecutive steps far apart
+    on the colour wheel.
+
+    Within a tile, saturation and value form a gradient, so the repeating
+    gradient plus the dark border makes the tile grid legible. A run of marker
+    squares along the top edge counts the time step, so you can read the date
+    off the image without checking which ``time=`` you asked for.
+
+    Channels are computed in floating point and scaled once, never wrapped --
+    a modulo here would make tiles of the same date look unrelated.
     """
     y, x = np.mgrid[0:size, 0:size].astype(np.float32) / max(size - 1, 1)
-    shift = 47 * step
-    data = np.zeros((bands, size, size), dtype=np.uint8)
-    data[0] = (40 + 200 * x + shift) % 256
-    data[1] = (40 + 200 * y + 2 * shift) % 256
-    data[2] = (40 + 60 * (row + col) + 3 * shift) % 256
+    hue = np.full((size, size), (0.61803398875 * step) % 1.0, dtype=np.float32)
+    saturation = 0.40 + 0.50 * x
+    # A slight per-tile shade so a duplicated or misplaced granule is spottable,
+    # small enough that the date still reads as one colour.
+    value = 0.55 + 0.40 * (1.0 - y) - 0.06 * (row + col)
+    data = (_hsv_to_rgb(hue, saturation, value) * 255).clip(0, 255).astype(np.uint8)
+    if bands != 3:
+        data = np.repeat(data[:1], bands, axis=0)
 
-    # Marker squares: one per time step, so you can read the step off the
-    # image without checking which time= you requested.
+    # Marker squares: one per time step.
     box = max(size // 16, 4)
     gap = max(box // 3, 2)
     for n in range(min(step + 1, (size - gap) // (box + gap))):
         left = gap + n * (box + gap)
-        data[:, gap : gap + box, left : left + box] = 245
+        data[:, gap : gap + box, left : left + box] = 250
 
     # A darker border makes individual granule edges visible in the mosaic,
     # so a gap or a misplaced tile is obvious at a glance.
