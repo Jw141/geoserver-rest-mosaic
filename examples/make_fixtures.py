@@ -91,17 +91,15 @@ def generate(
     dates: int = 3,
     size: int = 512,
     start: dt.datetime | None = None,
-    clean: bool = True,
+    prune: bool = True,
+    pruned: list[str] | None = None,
 ) -> list[Path]:
-    # Empty the directory rather than removing it.  It is bind-mounted into
-    # the LocalStack container, and deleting the directory a running container
-    # has mounted leaves that mount pointing at a path that no longer exists --
-    # the container then sees an empty directory and seeding silently does
-    # nothing.  Removing only the files keeps the mount valid.
+    # This directory is bind-mounted into the LocalStack container, so it is
+    # written in place: the directory itself is never removed, and granules are
+    # overwritten rather than deleted and recreated.  Deleting what a running
+    # container has mounted is how the mount ends up pointing at nothing.
     output.mkdir(parents=True, exist_ok=True)
-    if clean:
-        for stale in output.glob("*.tif"):
-            stale.unlink()
+    pruned = pruned if pruned is not None else []
 
     start = start or dt.datetime(2024, 3, 1, 10, 40, 21)
     written: list[Path] = []
@@ -113,6 +111,16 @@ def generate(
                 path = output / f"S2_{stamp}_r{row}c{col}.tif"
                 write_cog(path, tile_pixels(size, row, col, phase), tile_bounds(grid, row, col))
                 written.append(path)
+
+    if prune:
+        # Only granules that are not part of the new set -- left over from a
+        # run with a different --grid or --dates.  They would otherwise be
+        # seeded and harvested alongside the current ones.
+        keep = {path.name for path in written}
+        for stale in sorted(output.glob("*.tif")):
+            if stale.name not in keep:
+                stale.unlink()
+                pruned.append(stale.name)
     return written
 
 
@@ -124,9 +132,14 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=512, help="pixels per tile axis")
     args = parser.parse_args()
 
-    written = generate(args.output, grid=args.grid, dates=args.dates, size=args.size)
+    pruned: list[str] = []
+    written = generate(
+        args.output, grid=args.grid, dates=args.dates, size=args.size, pruned=pruned
+    )
     total = sum(path.stat().st_size for path in written)
     print(f"Wrote {len(written)} granules to {args.output} ({total / 1024:.0f} KiB)")
+    if pruned:
+        print(f"Removed {len(pruned)} granule(s) left over from a different layout")
     for path in written[:4]:
         print(f"  {path.name}")
     if len(written) > 4:
