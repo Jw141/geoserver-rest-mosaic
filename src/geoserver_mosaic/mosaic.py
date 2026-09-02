@@ -28,7 +28,7 @@ from typing import Any
 
 from . import payloads, properties
 from .client import GeoServerClient
-from .errors import MosaicConfigurationError, NotFoundError
+from .errors import GeoServerError, MosaicConfigurationError, NotFoundError
 from .models import (
     CogSettings,
     DimensionInfo,
@@ -278,6 +278,12 @@ class MosaicManager:
 
         if replace and self.client.coverage_store_exists(workspace, store):
             log.info("Replacing existing store %s:%s", workspace, store)
+            # Empty the granule index first.  Deleting a store leaves its index
+            # behind -- for PostGIS the table simply survives -- so a recreated
+            # mosaic would otherwise start out holding every granule of the old
+            # one, including granules whose files are long gone.  That reads as
+            # a successful build with a wrong granule count.
+            self._empty_index(workspace, store, definition.resolved_coverage())
             self.client.delete_coverage_store(
                 workspace, store, recurse=True, purge=purge
             )
@@ -309,6 +315,28 @@ class MosaicManager:
             harvested=harvested,
             failed=failed,
         )
+
+    def _empty_index(self, workspace: str, store: str, coverage: str) -> None:
+        """Drop every granule from a mosaic's index, if it has one yet.
+
+        Best-effort: a store created but never populated has no coverage and no
+        index, which is not an error here.  ``purge`` is deliberately not set --
+        this removes index entries, never granule files.
+        """
+        if not self.client.coverage_exists(workspace, store, coverage):
+            return
+        try:
+            self.client.delete_granules(workspace, store, coverage, purge=False)
+            log.debug("Emptied granule index for %s:%s", workspace, coverage)
+        except GeoServerError as exc:
+            # Worth surfacing: the recreated mosaic may inherit stale granules.
+            log.warning(
+                "Could not empty the granule index for %s:%s (%s). The "
+                "recreated mosaic may still hold granules from the old one.",
+                workspace,
+                coverage,
+                exc,
+            )
 
     def _index_is_populated(
         self, definition: MosaicDefinition, harvested: list[str]

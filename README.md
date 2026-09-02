@@ -162,12 +162,23 @@ initialise:
 500 Failed to create reader from file:data/<workspace>/<store> and hints Hints:
 ```
 
-`create(..., replace=True)` deletes the store but hits exactly this. Either pass
-`purge="all"` so GeoServer removes the store's files too — **never** for a
-mosaic whose granules are files you need to keep, it deletes them — or use a
-fresh store name. If a store name is already poisoned, remove
-`<data_dir>/data/<workspace>/<store>` on the GeoServer host and drop the index
-table.
+`create(..., replace=True)` handles the index: it empties the granule index
+before dropping the store, so a recreated mosaic does not start out holding
+every granule of the old one — including granules whose files are long gone.
+That silently inflates the granule count and looks like a successful build.
+
+Two cases it cannot fix over REST:
+
+- **A stale store directory** gives `Failed to create reader`. Use a fresh store
+  name, or remove `<data_dir>/data/<workspace>/<store>` on the GeoServer host.
+- **An orphaned index table** — the store was deleted by other means, leaving
+  its table behind. The new mosaic adopts those rows. Drop the table, or use a
+  fresh store name.
+
+`purge` follows GeoServer's own vocabulary, `"none"` / `"metadata"` / `"all"`;
+booleans are accepted and mapped. It is not a boolean on the wire — sending
+`purge=false` is rejected with a bare 400. `purge="all"` deletes granule files,
+so never use it on granules you need to keep.
 
 ## Empty mosaics
 

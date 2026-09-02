@@ -199,7 +199,7 @@ def test_delete_granules_passes_cql_filter(client):
     ).mock(return_value=httpx.Response(200))
     client.delete_granules("imagery", "s2", "s2", filter="time BEFORE 2024-01-01T00:00:00Z")
     assert route.calls.last.request.url.params["filter"] == "time BEFORE 2024-01-01T00:00:00Z"
-    assert route.calls.last.request.url.params["purge"] == "false"
+    assert route.calls.last.request.url.params["purge"] == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -530,3 +530,137 @@ def test_replace_can_purge_the_stores_files(client):
 
     MosaicManager(client).create(cog_mosaic(), replace=True, purge="all")
     assert delete.calls.last.request.url.params["purge"] == "all"
+
+
+# ---------------------------------------------------------------------------
+# purge is a vocabulary, not a boolean
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        (False, "none"), (None, "none"), (True, "all"),
+        ("none", "none"), ("metadata", "metadata"), ("all", "all"), ("ALL", "all"),
+    ],
+)
+def test_purge_values_map_to_geoservers_vocabulary(given, expected):
+    from geoserver_mosaic.client import _purge_value
+
+    assert _purge_value(given) == expected
+
+
+def test_purge_rejects_values_geoserver_would_400_on():
+    from geoserver_mosaic.client import _purge_value
+
+    # Sending purge=false is rejected by GeoServer with a bare 400, so a bool
+    # must never reach the wire verbatim.
+    with pytest.raises(ValueError, match="none.*metadata.*all"):
+        _purge_value("false")
+
+
+@respx.mock
+def test_delete_granules_sends_a_valid_purge_and_a_match_all_filter(client):
+    route = respx.delete(
+        f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2/index/granules"
+    ).mock(return_value=httpx.Response(200))
+    client.delete_granules("imagery", "s2", "s2")
+    params = route.calls.last.request.url.params
+    # A filterless delete is a 400; INCLUDE is CQL for "everything".
+    assert params["filter"] == "INCLUDE"
+    assert params["purge"] == "none"
+
+
+@respx.mock
+def test_replace_empties_the_index_before_dropping_the_store(client):
+    """Deleting a store leaves its index behind, stale granules and all."""
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    empty = respx.delete(
+        f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2/index/granules"
+    ).mock(return_value=httpx.Response(200))
+    drop = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
+        return_value=httpx.Response(201)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
+        return_value=httpx.Response(202)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
+        return_value=httpx.Response(201)
+    )
+    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
+        return_value=httpx.Response(200)
+    )
+
+    MosaicManager(client).create(cog_mosaic(), replace=True)
+
+    assert empty.called, "index must be emptied on replace"
+    assert drop.called
+    # purge stays none: this clears index entries, never granule files.
+    assert empty.calls.last.request.url.params["purge"] == "none"
+
+
+@respx.mock
+def test_replace_survives_a_store_with_no_index_yet(client):
+    """A store created but never populated has no coverage to empty."""
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
+        return_value=httpx.Response(404)
+    )
+    drop = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
+        return_value=httpx.Response(201)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
+        return_value=httpx.Response(202)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
+        return_value=httpx.Response(201)
+    )
+    MosaicManager(client).create(cog_mosaic(), replace=True)
+    assert drop.called
+
+
+@respx.mock
+def test_a_failed_index_empty_warns_but_does_not_abort(client, caplog):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.delete(
+        f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2/index/granules"
+    ).mock(return_value=httpx.Response(400, text="nope"))
+    respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
+        return_value=httpx.Response(201)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
+        return_value=httpx.Response(202)
+    )
+    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
+        return_value=httpx.Response(201)
+    )
+    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
+        return_value=httpx.Response(200)
+    )
+    result = MosaicManager(client).create(cog_mosaic(), replace=True)
+    assert result.published
+    assert "may still hold granules" in caplog.text

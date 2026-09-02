@@ -354,8 +354,8 @@ class GeoServerClient:
         remote COG granules you do not own.
         """
         params: dict[str, Any] = {"recurse": str(recurse).lower()}
-        if purge:
-            params["purge"] = purge
+        if purge is not None:
+            params["purge"] = _purge_value(purge)
         self.request(
             "DELETE", f"workspaces/{_q(workspace)}/coveragestores/{_q(store)}", params=params
         )
@@ -575,17 +575,24 @@ class GeoServerClient:
         coverage: str,
         *,
         filter: str | None = None,
-        purge: bool = False,
+        purge: bool | str = False,
     ) -> None:
         """Remove granules from the index.
 
-        Without ``filter`` this empties the whole index, so the argument is
-        required unless you genuinely mean "all".  ``purge=True`` also deletes
-        the underlying files -- never use it on remote granules you do not own.
+        ``filter`` is a CQL expression evaluated against the index.  Omitting it
+        empties the whole index: GeoServer rejects a filterless delete with 400,
+        so the CQL match-everything filter ``INCLUDE`` is sent instead.
+
+        ``purge`` takes GeoServer's own vocabulary -- ``"none"``, ``"metadata"``
+        or ``"all"`` -- and accepts booleans for convenience.  It is *not* a
+        boolean on the wire: sending ``purge=false`` is rejected with 400.
+        ``"all"`` deletes the underlying granule files, so never use it on
+        remote granules, or on local ones you do not own.
         """
-        params: dict[str, Any] = {"purge": str(purge).lower()}
-        if filter:
-            params["filter"] = filter
+        params: dict[str, Any] = {
+            "purge": _purge_value(purge),
+            "filter": filter or "INCLUDE",
+        }
         self.request(
             "DELETE",
             f"workspaces/{_q(workspace)}/coveragestores/{_q(store)}"
@@ -608,6 +615,24 @@ class GeoServerClient:
 
     def set_default_style(self, workspace: str, name: str, style: str) -> None:
         self.update_layer(workspace, name, payloads.layer(default_style=style))
+
+
+def _purge_value(purge: bool | str | None) -> str:
+    """Map a purge argument onto GeoServer's ``none|metadata|all`` vocabulary.
+
+    Booleans are accepted because they read naturally, but they must never
+    reach the wire: GeoServer rejects ``purge=false`` with a bare 400.
+    """
+    if purge is None or purge is False:
+        return "none"
+    if purge is True:
+        return "all"
+    value = str(purge).lower()
+    if value not in ("none", "metadata", "all"):
+        raise ValueError(
+            f"purge must be one of 'none', 'metadata', 'all' (or a bool), got {purge!r}"
+        )
+    return value
 
 
 def _names(payload: Any, container: str, item: str, *, plain: bool = False) -> list[str]:
