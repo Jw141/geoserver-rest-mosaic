@@ -336,8 +336,18 @@ instantly, and 3.0.0 in particular may not be published yet. Check Docker Hub
 for `kartoza/geoserver` and set `GS2_VERSION` / `GS3_VERSION` accordingly — the
 defaults here are the versions this library targets, not verified tags.
 
+**Do my mosaics survive a restart?** Yes, and nothing needs cleaning up.
+`make down` / `make up` keep the named volumes, so the GeoServer catalog, the
+store directories and the PostGIS index all persist — that is what makes the
+layer come back. Verified: after both a `restart` and a full `down`/`up`, the
+layer rendered identically with every granule still indexed. Only
+`make clean-volumes` (`down -v`) discards data.
+
 **`500 Failed to create reader from file:data/...`.** The store's data
-directory survived a previous delete and is stale. Use a fresh store name, or
+directory and its index have got out of step — typically because one was
+removed without the other. This does not happen on a restart; it happens when a
+store is deleted and recreated under the same name, or when the index table is
+dropped while the store directory survives. Use a fresh store name, or
 remove `<data_dir>/data/<workspace>/<store>` in the container and drop the
 PostGIS index table:
 

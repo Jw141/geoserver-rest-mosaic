@@ -151,34 +151,40 @@ mosaics.remove_granules(
 print(mosaics.describe(definition))
 ```
 
-## Recreating a store
+## Persistence and recreating a store
 
-Deleting a coverage store does **not** remove its data directory, and for a
-PostGIS index it does not drop the index table either. Recreating a store under
-the same name inherits whatever survived, which can leave the mosaic unable to
-initialise:
+**Restarts need no cleanup.** A mosaic's state lives in two places that are
+meant to survive: the store directory in the GeoServer data directory
+(`indexer.properties`, `datastore.properties`, `sample_image.dat`, ...) and the
+granule index table. Both persisting *is* the persistence mechanism. Verified
+against GeoServer 2.28.4 — after `docker compose restart`, and again after a
+full `down` and `up` that recreates the container, the layer rendered
+identically, the index kept every granule, and harvesting new granules
+continued to work. Nothing was deleted or reconfigured.
 
-```
-500 Failed to create reader from file:data/<workspace>/<store> and hints Hints:
-```
+For the docker stack that means `make down` / `make up` are safe; only
+`make clean-volumes` (`down -v`) discards anything, and it says so.
 
-`create(..., replace=True)` handles the index: it empties the granule index
-before dropping the store, so a recreated mosaic does not start out holding
-every granule of the old one — including granules whose files are long gone.
-That silently inflates the granule count and looks like a successful build.
+Cleanup is only relevant when **deleting a store and recreating it under the
+same name** — re-provisioning, not restarting:
 
-Two cases it cannot fix over REST:
-
-- **A stale store directory** gives `Failed to create reader`. Use a fresh store
-  name, or remove `<data_dir>/data/<workspace>/<store>` on the GeoServer host.
-- **An orphaned index table** — the store was deleted by other means, leaving
-  its table behind. The new mosaic adopts those rows. Drop the table, or use a
-  fresh store name.
+- `create(..., replace=True)` empties the granule index before dropping the
+  store, so the new mosaic does not inherit granules from the old one. Deleting
+  a store leaves its index behind, and stale rows would otherwise inflate the
+  granule count while the build still reported success.
+- Two cases it cannot fix over REST. **A stale store directory** gives
+  `500 Failed to create reader from file:data/...`; use a fresh store name or
+  remove `<data_dir>/data/<workspace>/<store>` on the host. **An orphaned index
+  table** — the store was deleted by other means, its table left behind — is
+  adopted by the new mosaic. Both come from the store directory and the index
+  disagreeing, which is what happens if one is removed without the other.
 
 `purge` follows GeoServer's own vocabulary, `"none"` / `"metadata"` / `"all"`;
 booleans are accepted and mapped. It is not a boolean on the wire — sending
 `purge=false` is rejected with a bare 400. `purge="all"` deletes granule files,
-so never use it on granules you need to keep.
+so never use it on granules you need to keep, and note that on a PostGIS-indexed
+mosaic GeoServer answers it with a 500 (`Unable to drop the database`) even
+though it does drop the store.
 
 ## Empty mosaics
 
