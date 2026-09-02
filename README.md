@@ -265,7 +265,13 @@ smoke test. It builds three mosaics, one per granule location:
 
 `make fixtures` generates the granules it uses: 12 real COGs — a 2x2 grid at 3
 timestamps, tiled with overviews — so the mosaic genuinely stitches and the time
-dimension genuinely has three instants.
+dimension genuinely has three instants. Each date is a different colour with
+marker squares counting the time step, so the preview shows which slice you are
+looking at.
+
+Generation is **additive** — nothing is deleted without `--prune`.
+`make fixtures-add DATES=2` appends two more dates after the newest existing
+one, so you can watch the mosaic grow across re-harvests.
 
 **The one gotcha**: the driver runs on your machine, but the granule URLs and
 database host it sends are resolved by *GeoServer*, inside the compose network.

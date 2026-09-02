@@ -24,6 +24,9 @@ URL      ?= $(if $(filter 3,$(GS)),$(GS3_URL),$(GS2_URL))
 # Which single mosaic `make mosaic` builds: local, remote or upload.
 WHICH    ?= remote
 
+# How many time steps `make fixtures-add` appends.
+DATES    ?= 1
+
 GEOSERVER_USER     ?= admin
 GEOSERVER_PASSWORD ?= geoserver
 
@@ -35,10 +38,10 @@ COMPOSE   = docker compose
 UV        = uv run --extra dev --extra examples
 
 .PHONY: help install test fixtures up up-gs3 up-all down clean-volumes logs ps \
-        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui
+        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui fixtures-add
 
 help:  ## Show this help
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 	@printf '\nTarget server: \033[33m%s\033[0m  (override with GS=3 or URL=...)\n' "$(URL)"
 
@@ -50,8 +53,12 @@ test:  ## Run the unit tests (no stack required)
 
 # --- stack -------------------------------------------------------------------
 
-fixtures:  ## Generate the demo COG granules into fixtures/tiles
+fixtures:  ## Generate the base demo COG granules into fixtures/tiles
 	$(UV) python examples/make_fixtures.py
+
+fixtures-add:  ## Append DATES more time steps, then re-seed: make fixtures-add DATES=2
+	$(UV) python examples/make_fixtures.py --append --dates $(DATES)
+	@echo "Now run 'make seed-s3' (remote mosaic) and re-harvest to see them."
 
 up: fixtures  ## Start PostGIS, LocalStack and GeoServer 2.28 (:8080)
 	$(COMPOSE) --profile gs2 up -d

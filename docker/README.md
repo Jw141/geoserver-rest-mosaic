@@ -121,7 +121,29 @@ resolves `localhost` to its own container.
 
 `make fixtures` writes 12 real COGs to `fixtures/tiles/` — a 2x2 spatial grid at
 3 timestamps, tiled with overviews, filenames like
-`S2_20240301T104021_r0c0.tif`. That directory is:
+`S2_20240301T104021_r0c0.tif`. Each date gets its own colour plus a run of
+marker squares along the top edge, one per time step, so a WMS preview at
+different `time=` values is unmistakably different.
+
+**Generation is additive.** Nothing is deleted unless you pass `--prune`; delete
+files yourself when you are ready. To watch the mosaic grow, append time steps
+and re-harvest:
+
+```bash
+make fixtures-add DATES=2     # two more dates after the newest existing one
+make seed-s3                  # push them to LocalStack
+make mosaic WHICH=remote      # re-harvest, then reload the WMS preview
+```
+
+Each run reports what changed:
+
+```
+  new: 8   overwritten: 12   kept: 0
+  directory now holds 20 granule(s), 2656 KiB
+  time steps: 2024-03-01, 2024-03-06, 2024-03-11, 2024-03-16, 2024-03-21
+```
+
+That directory is:
 
 - mounted read-only into GeoServer at `/opt/granules` (the "local" mosaic),
 - synced into the LocalStack bucket (the "remote" mosaic),
