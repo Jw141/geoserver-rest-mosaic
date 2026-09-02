@@ -9,6 +9,19 @@ set -euo pipefail
 
 BUCKET="${MOSAIC_BUCKET:-mosaic-tiles}"
 
+# The granules are mounted at /fixtures/tiles, mirroring their host path.
+# /fixtures is also accepted so an older container, created when the mount
+# landed one level up, still seeds instead of silently finding nothing.
+CANDIDATES=(/fixtures/tiles /fixtures)
+
+SRC=""
+for dir in "${CANDIDATES[@]}"; do
+    if compgen -G "$dir"/*.tif >/dev/null 2>&1; then
+        SRC="$dir"
+        break
+    fi
+done
+
 awslocal s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
 
 awslocal s3api put-bucket-policy --bucket "$BUCKET" --policy "{
@@ -22,9 +35,14 @@ awslocal s3api put-bucket-policy --bucket "$BUCKET" --policy "{
   }]
 }" >/dev/null
 
-if compgen -G "/fixtures/*.tif" >/dev/null; then
-    awslocal s3 sync /fixtures "s3://${BUCKET}/" --exclude "*" --include "*.tif" >/dev/null
-    echo "Seeded s3://${BUCKET} with $(ls -1 /fixtures/*.tif | wc -l) granules"
-else
-    echo "No fixtures found at /fixtures -- run 'make fixtures' then 'make seed-s3'"
+if [ -z "$SRC" ]; then
+    echo "No .tif granules found in: ${CANDIDATES[*]}"
+    echo "  Generate them on the host with 'make fixtures', then 'make seed-s3'."
+    echo "  Contents of /fixtures:"
+    ls -la /fixtures 2>/dev/null | sed 's/^/    /' || echo "    (/fixtures is not mounted)"
+    exit 0
 fi
+
+# Granules go in the bucket root: the driver builds URLs as <base>/<filename>.
+awslocal s3 sync "$SRC" "s3://${BUCKET}/" --exclude "*" --include "*.tif" >/dev/null
+echo "Seeded s3://${BUCKET} from ${SRC} with $(ls -1 "$SRC"/*.tif | wc -l) granules"

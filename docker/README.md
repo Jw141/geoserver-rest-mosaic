@@ -129,6 +129,18 @@ resolves `localhost` to its own container.
 
 Regenerating them needs a re-sync: `make seed-s3`.
 
+The granules are mounted into LocalStack at `/fixtures/tiles`, mirroring their
+host path so the two cannot drift. If `make seed-s3` reports finding nothing,
+the container predates that mount — recreate it:
+
+```bash
+docker compose up -d --force-recreate localstack
+```
+
+The seed script also accepts `/fixtures` so an older container still seeds
+rather than silently doing nothing, and lists the directory when it finds no
+`.tif` files at all.
+
 `make verify-s3` confirms LocalStack serves them the way the COG HTTP reader
 needs — an anonymous HTTP range request returning `206`. Worth running before
 blaming GeoServer, since it tests the bucket policy and range support without

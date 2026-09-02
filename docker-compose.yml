@@ -111,7 +111,8 @@ services:
       # Seeded on container ready; re-run with `make seed-s3` after
       # regenerating fixtures.
       - ./docker/localstack/ready.d:/etc/localstack/init/ready.d:ro
-      - ./fixtures/tiles:/fixtures:ro
+      # Mounted at the same path as on the host, so the two never drift.
+      - ./fixtures/tiles:/fixtures/tiles:ro
     healthcheck:
       test: ["CMD-SHELL", "awslocal s3 ls s3://${S3_BUCKET:-mosaic-tiles} >/dev/null 2>&1 || exit 1"]
       interval: 10s
