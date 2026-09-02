@@ -24,6 +24,9 @@ URL      ?= $(if $(filter 3,$(GS)),$(GS3_URL),$(GS2_URL))
 # Which single mosaic `make mosaic` builds: local, remote or upload.
 WHICH    ?= remote
 
+GEOSERVER_USER     ?= admin
+GEOSERVER_PASSWORD ?= geoserver
+
 S3_PORT   ?= 4566
 S3_BUCKET ?= mosaic-tiles
 
@@ -32,7 +35,7 @@ COMPOSE   = docker compose
 UV        = uv run --extra dev --extra examples
 
 .PHONY: help install test fixtures up up-gs3 up-all down clean-volumes logs ps \
-        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke
+        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -92,6 +95,17 @@ verify-s3:  ## Check LocalStack serves granules anonymously with range requests
 	esac
 
 # --- driving the client ------------------------------------------------------
+
+ui:  ## Print the GeoServer web UI URL and login
+	@echo "GeoServer web UI (note the /geoserver context path -- the bare host:port 404s):"
+	@echo "    $(URL)/web"
+	@echo "  login: $(GEOSERVER_USER) / $(GEOSERVER_PASSWORD)"
+	@ip=$$(ip -4 addr show eth0 2>/dev/null | awk '/inet /{print substr($$2,1,index($$2,"/")-1)}'); \
+	 if [ -n "$$ip" ]; then \
+	   echo "  if localhost does not resolve from your browser, try:"; \
+	   echo "    $$(echo $(URL) | sed "s#//localhost#//$$ip#")/web"; \
+	 fi
+	@printf '  reachable now: '; curl -s -o /dev/null -w 'HTTP %{http_code}\n' $(URL)/web || echo "no answer -- make ps"
 
 check:  ## Report the server version and which COG plugins installed
 	$(UV) python examples/driver.py --url $(URL) check

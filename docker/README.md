@@ -77,6 +77,29 @@ make smoke GS=3
 Running `make up-all` starts both, and running the driver against each port in
 turn is the compatibility check this stack exists for.
 
+## Reaching the web UI
+
+```bash
+make ui          # prints the URL, the login, and whether it answers
+make ui GS=3     # the 3.0 container instead
+```
+
+GeoServer is served under the **`/geoserver` context path**, so the bare
+host:port returns 404 and looks like the port was never published:
+
+| URL | |
+|---|---|
+| `http://localhost:8080` | 404 — no app at the root |
+| `http://localhost:8080/geoserver/web` | the web UI |
+
+Login is `admin` / `geoserver` (set by `GEOSERVER_PASSWORD`; Kartoza's own
+default, `myawesomegeoserver`, is overridden in the compose file).
+
+The ports are published by `docker-compose.yml` already — 8080 for 2.28, 8081
+for 3.0, both bound on all interfaces. On Docker Desktop with WSL2, `localhost`
+normally works from a Windows browser; if it does not, `make ui` also prints the
+distro's IP address to use instead.
+
 ## The hostname split
 
 This trips people up. The driver runs on **your machine**, but the granule URLs

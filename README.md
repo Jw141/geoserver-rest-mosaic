@@ -239,6 +239,10 @@ make ps                # wait for geoserver2 to report (healthy)
 make smoke             # check + build all three mosaics + report
 ```
 
+`make ui` prints the web UI URL and login — note GeoServer serves under the
+`/geoserver` context path, so `http://localhost:8080` alone returns 404 while
+`http://localhost:8080/geoserver/web` is the UI.
+
 `make smoke` chains `check`, `driver` and `inspect`. `make mosaic WHICH=remote`
 builds a single one. `make help` lists everything and shows the targeted server.
 
