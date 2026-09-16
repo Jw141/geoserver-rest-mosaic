@@ -21,7 +21,7 @@ GS2_URL  ?= http://localhost:8080/geoserver
 GS3_URL  ?= http://localhost:8081/geoserver
 URL      ?= $(if $(filter 3,$(GS)),$(GS3_URL),$(GS2_URL))
 
-# Which single mosaic `make mosaic` builds: local, remote or upload.
+# Which single mosaic `make mosaic` builds: local, remote, upload or external.
 WHICH    ?= remote
 
 # How many time steps `make fixtures-add` appends.
@@ -34,6 +34,14 @@ EXTENT   ?= 5 40 25 55
 GEOSERVER_USER     ?= admin
 GEOSERVER_PASSWORD ?= geoserver
 
+# Index tables go in a schema per GeoServer: both containers share one
+# PostGIS, and replacing a mosaic drops its index table, which would otherwise
+# pull the rug from under the other server's mosaic of the same name.
+PG_SCHEMA ?= gs$(GS)
+PG_DATABASE ?= gis
+PG_USER     ?= gis
+export PG_SCHEMA
+
 S3_PORT   ?= 4566
 S3_BUCKET ?= mosaic-tiles
 
@@ -42,7 +50,7 @@ COMPOSE   = docker compose
 UV        = uv run --extra dev --extra examples
 
 .PHONY: help install test fixtures up up-gs3 up-all down clean-volumes logs ps \
-        seed-s3 verify-s3 check driver mosaic inspect clean-gs integration smoke ui fixtures-add fixtures-scatter
+        seed-s3 verify-s3 pg-schemas check driver mosaic inspect clean-gs integration smoke ui fixtures-add fixtures-scatter
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -70,16 +78,24 @@ fixtures-add:  ## Append DATES more time steps, then re-seed: make fixtures-add 
 
 up: fixtures  ## Start PostGIS, LocalStack and GeoServer 2.28 (:8080)
 	$(COMPOSE) --profile gs2 up -d
+	@$(MAKE) --no-print-directory pg-schemas
 	@echo "GeoServer 2.28 starting on $(GS2_URL) -- first boot installs plugins, give it a few minutes"
 	@echo "Watch it come up:  make logs   |   then:  make smoke"
 
 up-gs3: fixtures  ## Start PostGIS, LocalStack and GeoServer 3.0 (:8081)
 	$(COMPOSE) --profile gs3 up -d
+	@$(MAKE) --no-print-directory pg-schemas
 	@echo "GeoServer 3.0 starting on $(GS3_URL)"
 	@echo "Then:  make smoke GS=3"
 
 up-all: fixtures  ## Start both GeoServer versions side by side
 	$(COMPOSE) --profile all up -d
+	@$(MAKE) --no-print-directory pg-schemas
+
+pg-schemas:  ## Create the per-server index schemas (gs2, gs3) in PostGIS
+	@$(COMPOSE) exec -T postgis psql -q -U $(PG_USER) -d $(PG_DATABASE) \
+	  -c 'create schema if not exists gs2; create schema if not exists gs3;' \
+	  && echo "PostGIS schemas gs2 and gs3 ready (index tables for GS=2 / GS=3)"
 
 ps:  ## Show container status and health
 	$(COMPOSE) --profile all ps
@@ -126,10 +142,10 @@ ui:  ## Print the GeoServer web UI URL and login
 check:  ## Report the server version and which COG plugins installed
 	$(UV) python examples/driver.py --url $(URL) check
 
-driver:  ## Build all three demo mosaics (local, remote, upload)
+driver:  ## Build all four demo mosaics (local, remote, upload, external)
 	$(UV) python examples/driver.py --url $(URL) --replace all
 
-mosaic:  ## Build one mosaic: make mosaic WHICH=remote|local|upload
+mosaic:  ## Build one mosaic: make mosaic WHICH=remote|local|upload|external
 	$(UV) python examples/driver.py --url $(URL) --replace $(WHICH)
 
 inspect:  ## Show the live state of the demo mosaics

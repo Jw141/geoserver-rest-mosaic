@@ -4,9 +4,12 @@
 Builds three mosaics against the docker-compose stack, one per granule
 location, so each supported path is demonstrated end to end:
 
-  local    granules on the GeoServer host, harvested by directory path
-  remote   COGs fetched from LocalStack S3 over HTTP, indexed in PostGIS
-  upload   granules shipped from this machine inside the configuration ZIP
+  local     granules on the GeoServer host, harvested by directory path
+  remote    COGs fetched from LocalStack S3 over HTTP, indexed in PostGIS
+  upload    granules shipped from this machine inside the configuration ZIP
+  external  a mosaic directory already on the host, registered as it stands
+            (it reuses the directory the upload case left in the data dir,
+            so build that first)
 
 Typical run::
 
@@ -44,6 +47,7 @@ from geoserver_mosaic import (
     PostgisIndex,
     ShapefileIndex,
     TimeRegex,
+    time_dimension,
 )
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "tiles"
@@ -72,10 +76,16 @@ class Settings:
     pg_database: str
     pg_user: str
     pg_password: str
+    #: Schema holding the index tables.  The two GeoServers in the stack share
+    #: one PostGIS, so each gets its own schema; otherwise replacing a mosaic
+    #: on one drops the index table under the other.
+    pg_schema: str
     #: Base URL of the granule bucket, again from GeoServer's perspective.
     s3_base: str
     #: Directory inside the GeoServer container holding the same granules.
     granule_dir: str
+    #: GeoServer's data directory, where uploaded stores are unpacked.
+    data_dir: str
 
     @classmethod
     def from_env(cls, url: str | None = None) -> "Settings":
@@ -88,10 +98,12 @@ class Settings:
             pg_database=os.environ.get("PG_DATABASE", "gis"),
             pg_user=os.environ.get("PG_USER", "gis"),
             pg_password=os.environ.get("PG_PASSWORD", "gis"),
+            pg_schema=os.environ.get("PG_SCHEMA", "public"),
             s3_base=os.environ.get(
                 "S3_BASE_FROM_GEOSERVER", "http://localstack:4566/mosaic-tiles"
             ),
             granule_dir=os.environ.get("GRANULE_DIR_IN_GEOSERVER", "/opt/granules"),
+            data_dir=os.environ.get("GEOSERVER_DATA_DIR", "/opt/geoserver/data_dir"),
         )
 
     def postgis_index(self) -> PostgisIndex:
@@ -101,6 +113,7 @@ class Settings:
             database=self.pg_database,
             user=self.pg_user,
             password=self.pg_password,
+            schema=self.pg_schema,
         )
 
     @property
@@ -188,10 +201,31 @@ def upload_mosaic(settings: Settings) -> MosaicDefinition:
     )
 
 
+def external_mosaic(settings: Settings) -> MosaicDefinition:
+    """A mosaic directory that already exists on the host, registered as is.
+
+    The directory is the one GeoServer unpacked the ``upload`` case into:
+    ``indexer.properties``, ``timeregex.properties``, the shapefile index and
+    the granules, all provisioned outside this definition.  Nothing here is
+    rendered into properties files; only layer metadata is sent, and the time
+    dimension has to be declared because the directory's indexer is not
+    readable from the client.
+    """
+    return MosaicDefinition(
+        workspace=WORKSPACE,
+        store="tiles-external",
+        location=f"{settings.data_dir}/data/{WORKSPACE}/tiles-upload/",
+        dimensions={"time": time_dimension()},
+        srs="EPSG:4326",
+        title="Pre-provisioned directory (registered, not configured)",
+    )
+
+
 BUILDERS = {
     "local": local_mosaic,
     "remote": remote_mosaic,
     "upload": upload_mosaic,
+    "external": external_mosaic,
 }
 
 
@@ -374,12 +408,12 @@ def cmd_inspect(client: GeoServerClient, settings: Settings, args) -> int:
 
 
 def cmd_clean(client: GeoServerClient, settings: Settings, args) -> int:
-    if not client.workspace_exists(WORKSPACE):
+    # The manager deletes each store with its directory and index table, so
+    # the names can be rebuilt; a bare recursive workspace delete would leave
+    # both behind and break the next run.  Granule files are never touched.
+    if not MosaicManager(client).delete_workspace(WORKSPACE):
         print(f"Workspace {WORKSPACE} does not exist; nothing to remove.")
         return 0
-    # recurse=True drops the stores, coverages and layers with it.  Granule
-    # files are untouched: no purge is requested anywhere in this driver.
-    client.delete_workspace(WORKSPACE, recurse=True)
     print(f"Deleted workspace {WORKSPACE} (granule files left in place).")
     return 0
 
@@ -407,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
         "command",
-        choices=["check", "local", "remote", "upload", "all", "inspect", "clean"],
+        choices=["check", *BUILDERS, "all", "inspect", "clean"],
     )
     args = parser.parse_args(argv)
 

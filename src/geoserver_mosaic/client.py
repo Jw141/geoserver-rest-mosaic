@@ -193,7 +193,7 @@ class GeoServerClient:
             raise NotFoundError(status, method, url, body)
         if status in (401, 403):
             raise AuthenticationError(status, method, url, body)
-        if status in (409, 500) and "already exists" in body.lower():
+        if status == 409 or (status == 500 and "already exists" in body.lower()):
             # GeoServer answers a duplicate create with 500 on some endpoints.
             raise ConflictError(status, method, url, body)
         raise GeoServerHTTPError(status, method, url, body)
@@ -344,7 +344,12 @@ class GeoServerClient:
         return payload.get("coverageStore", payload) if isinstance(payload, dict) else {}
 
     def delete_coverage_store(
-        self, workspace: str, store: str, *, recurse: bool = True, purge: str | None = None
+        self,
+        workspace: str,
+        store: str,
+        *,
+        recurse: bool = True,
+        purge: str | bool | None = None,
     ) -> None:
         """Delete a coverage store.
 
@@ -368,12 +373,24 @@ class GeoServerClient:
         *,
         configure: str = "none",
     ) -> None:
-        """PUT a ZIP to ``file.imagemosaic``, creating or updating the store.
+        """PUT a ZIP to ``file.imagemosaic``.
 
-        ``configure`` is GeoServer's publish policy: ``none`` creates the store
-        without publishing any layer (which is what you want when the coverage
-        is configured explicitly afterwards), ``first`` publishes the first
-        coverage found, ``all`` publishes every one.
+        What GeoServer does with the archive depends on whether the store
+        already exists, and the two behaviours are not interchangeable:
+
+        * **No such store**: the ZIP is unpacked into the store's directory
+          and a new ImageMosaic store is created from it.  This is how a
+          mosaic's ``.properties`` files reach the server.
+        * **Existing ImageMosaic store**: the ZIP is treated as a batch of
+          granules and *harvested* into the mosaic.  Any ``.properties``
+          files in it are ignored -- the store's configuration cannot be
+          changed this way.
+
+        ``configure`` is GeoServer's publish policy for the create case:
+        ``none`` creates the store without publishing any layer (which is what
+        you want when the coverage is configured explicitly afterwards),
+        ``first`` publishes the first coverage found, ``all`` publishes every
+        one.
         """
         self.request(
             "PUT",
@@ -388,26 +405,32 @@ class GeoServerClient:
         self,
         workspace: str,
         store: str,
-        directory_url: str,
+        directory: str,
         *,
         configure: str = "none",
     ) -> None:
         """Point a store at a directory already present on the GeoServer host.
 
-        ``directory_url`` must be a ``file:`` URL that GeoServer itself can
-        resolve, e.g. ``file:///var/geoserver/mosaics/rgb/``.  It travels in the
-        request body, not the REST path, so a trailing slash is fine here and is
-        conventional for a directory -- the no-trailing-slash rule that
-        :func:`_clean_path` enforces applies only to endpoint paths.
+        ``directory`` is the absolute path as the GeoServer process sees it,
+        e.g. ``/var/geoserver/mosaics/rgb/``.  A ``file:`` URL is accepted and
+        reduced to its path first: GeoServer's documentation shows the URL
+        form, but 2.28.4 answers it with ``400 Failed to locate the input
+        file`` for a directory that demonstrably exists, while the plain path
+        is resolved directly and works (the store then reports its ``url`` as
+        ``file:/...`` itself).  The location travels in the request body, not
+        the REST path, so a trailing slash is fine here and is conventional
+        for a directory -- the no-trailing-slash rule that :func:`_clean_path`
+        enforces applies only to endpoint paths.
         """
+        path = host_path(directory)
         self.request(
             "PUT",
             f"workspaces/{_q(workspace)}/coveragestores/{_q(store)}/external.imagemosaic",
             params={"configure": configure},
-            content=directory_url,
+            content=path,
             content_type="text/plain",
         )
-        log.info("Created store %s:%s from %s", workspace, store, directory_url)
+        log.info("Created store %s:%s from %s", workspace, store, path)
 
     def harvest(
         self, workspace: str, store: str, location: str, *, endpoint: str | None = None
@@ -430,6 +453,7 @@ class GeoServerClient:
         The endpoint is chosen from the location's scheme; pass ``endpoint`` as
         ``"remote"`` or ``"external"`` to override that.
         """
+        location = str(location)
         if endpoint is None:
             endpoint = "remote" if is_remote_location(location) else "external"
         if endpoint not in ("remote", "external"):
@@ -447,20 +471,35 @@ class GeoServerClient:
     def list_coverages(
         self, workspace: str, store: str, *, available: bool = False
     ) -> list[str]:
-        """List coverages in a store.
+        """List the coverages published from a store.
 
-        ``available=True`` lists what the store *could* publish but has not yet,
-        which is how you discover the mosaic's native name after creating a
-        store with ``configure=none``.
+        ``available=True`` asks instead for what the store *could* publish but
+        has not yet.  Prefer :meth:`list_native_coverages` for discovering a
+        mosaic's native name: on 2.28.4 the ``available`` listing came back
+        empty for a freshly registered external mosaic whose ``all`` listing
+        named it.
         """
-        params = {"list": "available"} if available else None
+        if available:
+            return self._list_coverages(workspace, store, "available")
+        payload = self.get_json(
+            f"workspaces/{_q(workspace)}/coveragestores/{_q(store)}/coverages.json"
+        )
+        return _names(payload, "coverages", "coverage")
+
+    def list_native_coverages(self, workspace: str, store: str) -> list[str]:
+        """Every coverage name the store's reader exposes, published or not.
+
+        For an ImageMosaic this is the indexer's ``Name``; it is what a
+        coverage's ``nativeName`` must be set to.
+        """
+        return self._list_coverages(workspace, store, "all")
+
+    def _list_coverages(self, workspace: str, store: str, kind: str) -> list[str]:
         payload = self.get_json(
             f"workspaces/{_q(workspace)}/coveragestores/{_q(store)}/coverages.json",
-            params=params,
+            params={"list": kind},
         )
-        if available:
-            return _names(payload, "list", "string", plain=True)
-        return _names(payload, "coverages", "coverage")
+        return _names(payload, "list", "string", plain=True)
 
     def coverage_exists(self, workspace: str, store: str, coverage: str) -> bool:
         return self.exists(
@@ -600,6 +639,47 @@ class GeoServerClient:
             params=params,
         )
 
+    # -- data directory resources -----------------------------------------
+
+    @staticmethod
+    def store_directory(workspace: str, store: str) -> str:
+        """Where GeoServer unpacks a store uploaded via ``file.<format>``.
+
+        Relative to the data directory, as the resource API addresses it.
+        """
+        return f"data/{workspace}/{store}"
+
+    def resource_exists(self, path: str) -> bool:
+        """Whether ``path`` (relative to the data directory) exists."""
+        return self.exists(f"resource/{_resource_path(path)}")
+
+    def read_resource(self, path: str) -> str:
+        """Read a text file inside the data directory."""
+        response = self.request("GET", f"resource/{_resource_path(path)}", accept="text/plain")
+        return response.text
+
+    def write_resource(self, path: str, text: str) -> None:
+        """Create or overwrite a text file inside the data directory."""
+        self.request(
+            "PUT", f"resource/{_resource_path(path)}", content=text, content_type="text/plain"
+        )
+        log.info("Wrote data directory resource %s", path)
+
+    def delete_resource(self, path: str) -> None:
+        """Delete a file or directory inside the data directory.
+
+        This is the only REST route that reaches the files GeoServer keeps
+        for a store.  Deleting a store leaves its directory behind, and the
+        mosaic configuration GeoServer wrote there (``<name>.properties``)
+        outranks a freshly uploaded ``indexer.properties`` when a store of
+        the same name is created again -- verified on 2.28.4, where a mosaic
+        re-created with the S3 range reader kept using the HTTP one from the
+        old directory.  ``purge=metadata`` on the store delete does not remove
+        that file.
+        """
+        self.request("DELETE", f"resource/{_resource_path(path)}")
+        log.info("Deleted data directory resource %s", path)
+
     # -- layers ------------------------------------------------------------
 
     def layer_exists(self, workspace: str, name: str) -> bool:
@@ -615,6 +695,30 @@ class GeoServerClient:
 
     def set_default_style(self, workspace: str, name: str, style: str) -> None:
         self.update_layer(workspace, name, payloads.layer(default_style=style))
+
+
+def _resource_path(path: str) -> str:
+    """Encode each segment of a data-directory path, keeping the slashes."""
+    return "/".join(_q(segment) for segment in path.split("/") if segment)
+
+
+def host_path(location: str) -> str:
+    """Reduce a host-side location to the plain path GeoServer resolves.
+
+    ``file:///data/x``, ``file:/data/x`` and ``/data/x`` all become
+    ``/data/x``.  Anything else is passed through untouched.
+    """
+    text = str(location)
+    if text.lower().startswith("file:"):
+        rest = text[len("file:"):]
+        # file:///x -> ///x -> /x ; file:/x -> /x ; file:data/x (relative, as
+        # GeoServer reports its own stores) -> data/x ; file://host/x is not
+        # local and is left for GeoServer to reject.
+        if rest.startswith("///"):
+            return rest[2:]
+        if not rest.startswith("//"):
+            return rest
+    return text
 
 
 def _purge_value(purge: bool | str | None) -> str:

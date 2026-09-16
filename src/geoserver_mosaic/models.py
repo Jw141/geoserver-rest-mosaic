@@ -19,8 +19,27 @@ REMOTE_SCHEMES = ("http://", "https://", "s3://", "gs://", "azure://", "wasb://"
 
 
 def is_remote_location(location: str) -> bool:
-    """True when a granule location is a remote URL rather than a local path."""
-    return str(location).startswith(REMOTE_SCHEMES)
+    """True when a granule location is a remote URL rather than a local path.
+
+    The scheme is compared case-insensitively: ``S3://`` is as remote as
+    ``s3://``, and routing it to the local-file endpoint would fail.
+    """
+    return str(location).lower().startswith(REMOTE_SCHEMES)
+
+
+def schema_attributes(schema: str) -> list[str]:
+    """Attribute names declared in an index schema string.
+
+    ``"*the_geom:Polygon,location:String,time:java.util.Date"`` yields
+    ``["the_geom", "location", "time"]``.  The leading ``*`` marks the default
+    geometry and is not part of the name.
+    """
+    names: list[str] = []
+    for part in schema.split(","):
+        part = part.strip().lstrip("*").strip()
+        if part:
+            names.append(part.split(":", 1)[0].strip())
+    return names
 
 
 # --------------------------------------------------------------------------
@@ -304,20 +323,25 @@ class IndexerConfig:
         props.update(self.extra)
         return props
 
+    def attributes(self) -> list[str]:
+        """Attribute names declared in :attr:`schema`."""
+        return schema_attributes(self.schema)
+
     def validate(self) -> None:
         """Catch configurations the mosaic reader would reject at runtime."""
-        if self.time_attribute and self.time_attribute not in self.schema:
+        attributes = self.attributes()
+        if self.time_attribute and self.time_attribute not in attributes:
             raise MosaicConfigurationError(
                 f"TimeAttribute {self.time_attribute!r} is not present in the "
                 f"index schema {self.schema!r}; add it, e.g. "
                 f"'...,{self.time_attribute}:java.util.Date'"
             )
-        if self.elevation_attribute and self.elevation_attribute not in self.schema:
+        if self.elevation_attribute and self.elevation_attribute not in attributes:
             raise MosaicConfigurationError(
                 f"ElevationAttribute {self.elevation_attribute!r} is not "
                 f"present in the index schema {self.schema!r}"
             )
-        if "location" not in self.schema:
+        if "location" not in attributes:
             raise MosaicConfigurationError(
                 "The index schema must contain a 'location:String' attribute"
             )

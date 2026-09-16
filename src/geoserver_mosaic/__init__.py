@@ -57,6 +57,7 @@ from .mosaic import (
     MosaicManager,
     MosaicResult,
     build_config_archive,
+    build_granule_archive,
 )
 
 __version__ = "0.1.0"
@@ -87,6 +88,7 @@ __all__ = [
     "Version",
     "__version__",
     "build_config_archive",
+    "build_granule_archive",
     "time_dimension",
     "timestamp_collector",
 ]

@@ -103,6 +103,7 @@ def test_create_workspace_with_uri_goes_through_namespaces(client):
         (404, "no such workspace", NotFoundError),
         (401, "", AuthenticationError),
         (403, "", AuthenticationError),
+        (409, "", ConflictError),
         (500, "Store 'x' already exists in workspace", ConflictError),
         (500, "java.lang.NullPointerException", GeoServerHTTPError),
     ],
@@ -220,10 +221,59 @@ def cog_mosaic() -> MosaicDefinition:
     )
 
 
+STORE = f"{BASE}/workspaces/imagery/coveragestores/s2"
+
+
+STORE_DIR = f"{BASE}/resource/data/imagery/s2"
+CONFIG = f"{STORE_DIR}/s2.properties"  # GeoServer's own mosaic config, named after the indexer
+
+
+def store_absent(*, directory: bool = False):
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    respx.get(CONFIG).mock(return_value=httpx.Response(404))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200 if directory else 404))
+
+
+def directory_deleted():
+    return respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+
+
+def config_present(text: str = "Name=s2\nCogRangeReader=old.Http\nLevels=1,1\n"):
+    """A kept store directory with GeoServer's derived mosaic config in it."""
+    respx.get(CONFIG).mock(return_value=httpx.Response(200, text=text))
+    return respx.put(CONFIG).mock(return_value=httpx.Response(201))
+
+
+def index_holds(*locations: str):
+    """The published coverage's granule index, as create() verifies it."""
+    features = [{"properties": {"location": l}} for l in locations]
+    return respx.get(f"{STORE}/coverages/s2/index/granules.json").mock(
+        return_value=httpx.Response(200, json={"features": features})
+    )
+
+
+COG_GRANULES = ("s3://bucket/20240301.tif", "s3://bucket/20240302.tif")
+
+
+def store_present(*coverages: str):
+    """An existing store, publishing the given coverages, with a kept directory."""
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    config_present()
+    for coverage in coverages:
+        respx.delete(f"{STORE}/coverages/{coverage}/index/granules").mock(
+            return_value=httpx.Response(200)
+        )
+    listing = {"coverages": {"coverage": [{"name": c} for c in coverages]}} if coverages else {"coverages": ""}
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json=listing))
+
+
 @respx.mock
 def test_create_runs_the_full_bootstrap_sequence(client):
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(404))
     respx.post(f"{BASE}/workspaces").mock(return_value=httpx.Response(201))
+    store_absent()
+    index_holds(*COG_GRANULES)
     upload = respx.put(
         f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic"
     ).mock(return_value=httpx.Response(201))
@@ -243,6 +293,7 @@ def test_create_runs_the_full_bootstrap_sequence(client):
     assert harvest.call_count == 2
     assert result.harvested == ["s3://bucket/20240301.tif", "s3://bucket/20240302.tif"]
     assert result.published is True
+    assert result.created is True
     assert result.ok
     assert result.layer == "imagery:s2"
 
@@ -257,6 +308,8 @@ def test_create_runs_the_full_bootstrap_sequence(client):
 @respx.mock
 def test_a_failed_granule_does_not_abort_the_rest(client):
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    index_holds("s3://bucket/20240302.tif")
     respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
         return_value=httpx.Response(201)
     )
@@ -281,6 +334,7 @@ def test_a_failed_granule_does_not_abort_the_rest(client):
 @respx.mock
 def test_empty_mosaic_is_created_but_not_published(client):
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
     upload = respx.put(
         f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic"
     ).mock(return_value=httpx.Response(201))
@@ -314,9 +368,8 @@ def test_publishing_an_existing_coverage_updates_it(client):
 @respx.mock
 def test_replace_deletes_the_store_first(client):
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
+    store_present()
+    index_holds(*COG_GRANULES)
     delete = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
         return_value=httpx.Response(200)
     )
@@ -402,6 +455,7 @@ def test_no_generated_endpoint_ends_in_a_slash(client):
     client.harvest("imagery", "s2", "s3://bucket/a.tif")
     client.list_coverages("imagery", "s2")
     client.list_coverages("imagery", "s2", available=True)
+    client.list_native_coverages("imagery", "s2")
     client.get_coverage("imagery", "s2", "s2")
     client.delete_coverage("imagery", "s2", "s2")
     client.index_schema("imagery", "s2", "s2")
@@ -426,8 +480,8 @@ def test_external_dir_body_keeps_its_trailing_slash(client):
     route = respx.put(
         f"{BASE}/workspaces/imagery/coveragestores/s2/external.imagemosaic"
     ).mock(return_value=httpx.Response(201))
-    client.create_store_from_external_dir("imagery", "s2", "file:///data/tiles/")
-    assert route.calls.last.request.content == b"file:///data/tiles/"
+    client.create_store_from_external_dir("imagery", "s2", "/data/tiles/")
+    assert route.calls.last.request.content == b"/data/tiles/"
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +499,7 @@ def test_external_dir_body_keeps_its_trailing_slash(client):
     "location,expected",
     [
         ("s3://bucket/a.tif", "remote"),
+        ("S3://bucket/a.tif", "remote"),
         ("http://host/a.tif", "remote"),
         ("https://host/a.tif", "remote"),
         ("gs://bucket/a.tif", "remote"),
@@ -509,9 +564,8 @@ def test_replace_can_purge_the_stores_files(client):
     mosaic unable to initialise, so the option has to be reachable.
     """
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
+    store_present()
+    index_holds(*COG_GRANULES)
     delete = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
         return_value=httpx.Response(200)
     )
@@ -571,96 +625,770 @@ def test_delete_granules_sends_a_valid_purge_and_a_match_all_filter(client):
     assert params["purge"] == "none"
 
 
-@respx.mock
-def test_replace_empties_the_index_before_dropping_the_store(client):
-    """Deleting a store leaves its index behind, stale granules and all."""
-    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    empty = respx.delete(
-        f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2/index/granules"
-    ).mock(return_value=httpx.Response(200))
-    drop = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
-        return_value=httpx.Response(201)
-    )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
-        return_value=httpx.Response(202)
-    )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
-        return_value=httpx.Response(201)
-    )
-    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
-        return_value=httpx.Response(200)
-    )
 
-    MosaicManager(client).create(cog_mosaic(), replace=True)
 
-    assert empty.called, "index must be emptied on replace"
-    assert drop.called
-    # purge stays none: this clears index entries, never granule files.
-    assert empty.calls.last.request.url.params["purge"] == "none"
+
+
+
+
+# ---------------------------------------------------------------------------
+# Re-running create() on a store that already exists
+#
+# GeoServer has no REST route that reconfigures an ImageMosaic in place, and a
+# config ZIP uploaded to an existing store is harvested, not applied.  So a
+# repeat run keeps the configuration, harvests what is new, and refreshes the
+# coverage metadata.
+# ---------------------------------------------------------------------------
 
 
 @respx.mock
-def test_replace_survives_a_store_with_no_index_yet(client):
-    """A store created but never populated has no coverage to empty."""
+def test_existing_store_is_harvested_into_not_reconfigured(client, tmp_path):
+    granule = tmp_path / "20240303.tif"
+    granule.write_bytes(b"tiff")
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
-        return_value=httpx.Response(404)
-    )
-    drop = respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
-        return_value=httpx.Response(201)
-    )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
-        return_value=httpx.Response(202)
-    )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
-        return_value=httpx.Response(201)
-    )
-    MosaicManager(client).create(cog_mosaic(), replace=True)
-    assert drop.called
+    store_present("s2")
+    index_holds(*COG_GRANULES, "/srv/gs/data/imagery/s2/20240303.tif")
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(202))
+    harvest = respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(200))
+    update = respx.put(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(200))
+
+    definition = cog_mosaic()
+    definition.upload_files = [granule]
+    result = MosaicManager(client).create(definition)
+
+    assert result.created is False
+    assert result.published is True
+    assert harvest.call_count == 2
+    assert update.called
+    # The archive PUT to an existing store is a harvest: granules only, no
+    # configuration files that GeoServer would ignore anyway.
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(upload.calls.last.request.content)) as archive:
+        assert archive.namelist() == ["20240303.tif"]
 
 
 @respx.mock
-def test_a_failed_index_empty_warns_but_does_not_abort(client, caplog):
+def test_existing_published_store_with_nothing_new_still_refreshes_metadata(client):
     respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
+    store_present("s2")
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(200))
+    update = respx.put(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(200))
+
+    definition = cog_mosaic()
+    definition.granules = []
+    result = MosaicManager(client).create(definition)
+
+    assert result.created is False
+    assert result.published is True
+    assert update.called
+
+
+@respx.mock
+def test_existing_unpublished_store_with_nothing_new_stays_unpublished(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_present()
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    publish = respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    definition = cog_mosaic()
+    definition.granules = []
+    result = MosaicManager(client).create(definition)
+
+    assert result.created is False
+    assert result.published is False
+    assert not publish.called
+
+
+@respx.mock
+def test_add_files_uploads_a_granule_only_archive(client, tmp_path):
+    granule = tmp_path / "a.tif"
+    granule.write_bytes(b"tiff")
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(202))
+
+    assert MosaicManager(client).add_files("imagery", "s2", [granule]) == ["a.tif"]
+
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(upload.calls.last.request.content)) as archive:
+        assert archive.namelist() == ["a.tif"]
+
+
+
+
+# ---------------------------------------------------------------------------
+# A pre-provisioned mosaic directory on the GeoServer host
+# ---------------------------------------------------------------------------
+
+
+def external_mosaic(**overrides) -> MosaicDefinition:
+    defaults = dict(
+        workspace="imagery",
+        store="s2",
+        location="/data/mosaics/s2/",
+        title="Pre-built mosaic",
     )
-    respx.get(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
-        return_value=httpx.Response(200)
+    return MosaicDefinition(**{**defaults, **overrides})
+
+
+@respx.mock
+def test_external_directory_is_registered_rather_than_uploaded(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    register = respx.put(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(201))
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    listing = respx.get(f"{STORE}/coverages.json").mock(
+        return_value=httpx.Response(200, json={"list": {"string": ["s2_mosaic"]}})
     )
-    respx.delete(
-        f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2/index/granules"
-    ).mock(return_value=httpx.Response(400, text="nope"))
-    respx.delete(f"{BASE}/workspaces/imagery/coveragestores/s2").mock(
-        return_value=httpx.Response(200)
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    publish = respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    result = MosaicManager(client).create(external_mosaic())
+
+    assert result.published and result.created
+    assert not upload.called
+    request = register.calls.last.request
+    # A plain path: 2.28.4 rejects the file: URL form with "Failed to locate".
+    assert request.content == b"/data/mosaics/s2/"
+    # list=all, not list=available, which came back empty on a live server.
+    assert listing.calls.last.request.url.params["list"] == "all"
+    assert request.url.params["configure"] == "none"
+    # The native name is whatever the directory's own indexer calls the mosaic.
+    assert "<nativeName>s2_mosaic</nativeName>" in publish.calls.last.request.content.decode()
+
+
+@respx.mock
+def test_external_directory_native_name_can_be_pinned(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(201))
+    listing = respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    publish = respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    MosaicManager(client).create(external_mosaic(mosaic_name="pinned"))
+
+    assert not listing.called
+    assert "<nativeName>pinned</nativeName>" in publish.calls.last.request.content.decode()
+
+
+@respx.mock
+def test_external_directory_with_several_coverages_needs_mosaic_name(client):
+    from geoserver_mosaic import MosaicConfigurationError
+
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages.json").mock(
+        return_value=httpx.Response(200, json={"list": {"string": ["a", "b"]}})
     )
-    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/file.imagemosaic").mock(
-        return_value=httpx.Response(201)
+    with pytest.raises(MosaicConfigurationError, match="mosaic_name"):
+        MosaicManager(client).create(external_mosaic())
+
+
+@respx.mock
+def test_external_file_url_is_reduced_to_a_path(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    register = respx.put(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(201))
+    MosaicManager(client).create(
+        external_mosaic(location="file:///srv/mosaic", mosaic_name="m"), publish=False
     )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/remote.imagemosaic").mock(
-        return_value=httpx.Response(202)
-    )
-    respx.post(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages").mock(
-        return_value=httpx.Response(201)
-    )
-    respx.put(f"{BASE}/workspaces/imagery/coveragestores/s2/coverages/s2").mock(
-        return_value=httpx.Response(200)
-    )
-    result = MosaicManager(client).create(cog_mosaic(), replace=True)
+    assert register.calls.last.request.content == b"/srv/mosaic"
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        ("/srv/mosaic/", "/srv/mosaic/"),
+        ("file:///srv/mosaic/", "/srv/mosaic/"),
+        ("file:/srv/mosaic", "/srv/mosaic"),
+        ("FILE:///srv/mosaic", "/srv/mosaic"),
+        ("file:data/imagery/s2", "data/imagery/s2"),  # as GeoServer reports its own stores
+        ("file://nas/share/mosaic", "file://nas/share/mosaic"),  # not local: left alone
+        ("C:\\mosaic", "C:\\mosaic"),
+    ],
+)
+def test_host_path_reduces_file_urls(given, expected):
+    from geoserver_mosaic.client import host_path
+
+    assert host_path(given) == expected
+
+
+# ---------------------------------------------------------------------------
+# Harvest verification
+#
+# GeoServer answers every harvest POST with 202 and an empty body -- a bogus
+# key, an unreachable bucket and a misconfigured range reader all look like
+# success on the wire.  The index is the only evidence, so create() asks it.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_granules_accepted_but_not_indexed_are_reported_as_failed(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    # Only the first granule made it into the index.
+    lookup = index_holds("s3://bucket/20240301.tif")
+
+    result = MosaicManager(client).create(cog_mosaic())
+
     assert result.published
-    assert "may still hold granules" in caplog.text
+    assert result.harvested == ["s3://bucket/20240301.tif"]
+    assert [l for l, _ in result.failed] == ["s3://bucket/20240302.tif"]
+    assert "absent from the index" in result.failed[0][1]
+    assert result.ok is False
+    # Looked up by name, so the cost scales with the batch, not the index.
+    cql = lookup.calls.last.request.url.params["filter"]
+    assert cql == "location IN ('s3://bucket/20240301.tif','s3://bucket/20240302.tif')"
+
+
+@respx.mock
+def test_verification_can_be_switched_off(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    lookup = index_holds()
+
+    result = MosaicManager(client).create(cog_mosaic(), verify=False)
+
+    assert not lookup.called
+    assert len(result.harvested) == 2
+
+
+@respx.mock
+def test_directory_harvest_is_verified_by_a_non_empty_index(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    lookup = index_holds()  # nothing indexed
+
+    definition = cog_mosaic()
+    definition.cog = None
+    definition.granules = ["/opt/granules"]
+    result = MosaicManager(client).create(definition)
+
+    assert result.harvested == []
+    assert [l for l, _ in result.failed] == ["/opt/granules"]
+    assert "index is empty" in result.failed[0][1]
+    # A directory cannot be matched by name; only the emptiness check runs.
+    assert "filter" not in lookup.calls.last.request.url.params
+    assert lookup.calls.last.request.url.params["limit"] == "1"
+
+
+def test_cql_string_escapes_quotes():
+    from geoserver_mosaic.mosaic import _cql_string, _index_location, _names_one_granule
+
+    assert _cql_string("it's") == "'it''s'"
+    assert _names_one_granule("s3://b/a.tif") and _names_one_granule("/d/a.tif")
+    assert not _names_one_granule("/opt/granules") and not _names_one_granule("file:///opt/granules/")
+    assert _index_location("file:///opt/granules/a.tif") == "/opt/granules/a.tif"
+    assert _index_location("s3://b/a.tif") == "s3://b/a.tif"
+
+
+# ---------------------------------------------------------------------------
+# The store directory outlives the store, and its contents outrank a new
+# indexer.properties.  Verified on 2.28.4: a mosaic re-created with the S3
+# range reader kept reading through HTTP because <store>.properties from the
+# old directory said so.  Only the resource API can remove it.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+@respx.mock
+def test_resource_paths_are_encoded_per_segment(client):
+    route = respx.delete(f"{BASE}/resource/data/my%20ws/s2").mock(return_value=httpx.Response(200))
+    client.delete_resource("data/my ws/s2")
+    assert route.called
+
+
+@respx.mock
+def test_uploaded_files_are_verified_by_basename(client, tmp_path):
+    """The index holds the server-side path, so only the name can be matched."""
+    granule = tmp_path / "20240303.tif"
+    granule.write_bytes(b"tiff")
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    lookup = index_holds("/opt/geoserver/data_dir/data/imagery/s2/20240303.tif")
+
+    definition = cog_mosaic()
+    definition.granules = []
+    definition.upload_files = [granule]
+    result = MosaicManager(client).create(definition)
+
+    assert result.failed == []
+    assert lookup.calls.last.request.url.params["filter"] == "location LIKE '%/20240303.tif'"
+
+
+@respx.mock
+def test_missing_uploaded_file_is_reported_with_its_local_path(client, tmp_path):
+    granule = tmp_path / "20240303.tif"
+    granule.write_bytes(b"tiff")
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    index_holds()
+
+    definition = cog_mosaic()
+    definition.granules = []
+    definition.upload_files = [granule]
+    result = MosaicManager(client).create(definition)
+
+    assert [l for l, _ in result.failed] == [str(granule)]
+
+
+# ---------------------------------------------------------------------------
+# An index table left behind by an earlier store of the same name.  The new
+# store accepts every harvest, indexes nothing, and cannot be published.  The
+# only REST route to the table is purging the store, so create() does that
+# once and rebuilds.
+# ---------------------------------------------------------------------------
+
+
+
+
+@respx.mock
+def test_orphaned_index_heal_is_not_attempted_for_a_shapefile_index(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(
+        return_value=httpx.Response(500, text="The specified coverageName is unavailable")
+    )
+    definition = MosaicDefinition(workspace="imagery", store="s2", granules=["/opt/granules"])
+    with pytest.raises(GeoServerHTTPError):
+        MosaicManager(client).create(definition)
+
+
+@respx.mock
+def test_other_publish_errors_are_raised_untouched(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(500, text="NullPointerException"))
+    purge = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    with pytest.raises(GeoServerHTTPError):
+        MosaicManager(client).create(cog_mosaic())
+    assert not purge.called
+
+
+# ---------------------------------------------------------------------------
+# Deleting cleanly, so a name can be rebuilt
+# ---------------------------------------------------------------------------
+
+
+
+
+@respx.mock
+def test_delete_leaves_an_external_stores_index_and_directory_alone(client):
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}.json").mock(
+        return_value=httpx.Response(200, json={"coverageStore": {"url": "file:/srv/mosaics/s2/"}})
+    )
+    drop = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    probe = respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+
+    MosaicManager(client).delete("imagery", "s2")
+    assert "purge" not in drop.calls.last.request.url.params
+    assert not probe.called
+
+
+@respx.mock
+def test_delete_of_a_missing_store_is_a_no_op(client):
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    assert MosaicManager(client).delete("imagery", "s2") is False
+
+
+
+
+
+
+
+
+@respx.mock
+def test_an_explicit_purge_500_with_the_store_still_present_is_raised(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={"coverages": ""}))
+    respx.delete(STORE).mock(return_value=httpx.Response(500, text="Unable to drop the database: "))
+
+    with pytest.raises(GeoServerHTTPError):
+        MosaicManager(client).create(cog_mosaic(), replace=True, purge="metadata")
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# replace: empty the index, delete the store, keep the directory, patch the
+# mosaic configuration GeoServer wrote there, build again over it.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_replace_keeps_the_directory_and_patches_the_mosaic_config(client):
+    from geoserver_mosaic import properties
+
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}/coverages.json").mock(
+        return_value=httpx.Response(200, json={"coverages": {"coverage": [{"name": "s2"}]}})
+    )
+    emptied = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    drop = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    rmdir = respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+    patched = config_present("Name=s2\nCogRangeReader=old.Http\nLevels=1,1\nEnvelope2D=0,0,1,1\n")
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    pruned = respx.delete(f"{STORE}/coverages/s2/index/granules")
+    index_holds(*COG_GRANULES)
+
+    result = MosaicManager(client).create(cog_mosaic(), replace=True)
+
+    assert result.ok and result.created
+    assert emptied.called
+    assert "purge" not in drop.calls.last.request.url.params
+    assert not rmdir.called
+    assert upload.called
+    written = properties.loads(patched.calls.last.request.content.decode())
+    assert written["CogRangeReader"].endswith("S3RangeReader")  # this definition's
+    assert written["Levels"] == "1,1" and written["Envelope2D"] == "0,0,1,1"  # GeoServer's, kept
+    # The index was emptied, so nothing is stale and nothing is pruned.
+    assert emptied.call_count == 1
+
+
+@respx.mock
+def test_replace_of_an_unpublished_store_prunes_after_verification(client):
+    """No coverage means the index could not be emptied; prune what did not land."""
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={"coverages": ""}))
+    respx.delete(STORE).mock(return_value=httpx.Response(200))
+    config_present()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    pruned = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    index_holds(*COG_GRANULES, "s3://bucket/old.tif")
+
+    MosaicManager(client).create(cog_mosaic(), replace=True)
+
+    assert pruned.calls.last.request.url.params["filter"] == "location IN ('s3://bucket/old.tif')"
+
+
+@respx.mock
+def test_a_leftover_directory_with_a_config_is_reused_and_pruned(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    patched = config_present()
+    rmdir = respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    pruned = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    index_holds(*COG_GRANULES, "s3://bucket/old.tif")
+
+    result = MosaicManager(client).create(cog_mosaic())
+
+    assert result.ok
+    assert patched.called and not rmdir.called
+    assert pruned.called
+
+
+@respx.mock
+def test_a_leftover_directory_without_a_config_is_removed(client, caplog):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent(directory=True)
+    removed = directory_deleted()
+    index_holds(*COG_GRANULES)
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    MosaicManager(client).create(cog_mosaic())
+
+    assert removed.called
+    assert "left behind" in caplog.text
+
+
+@respx.mock
+def test_reused_index_after_a_directory_harvest_is_kept_with_a_warning(client, caplog):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    config_present()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    pruned = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    index_holds("/opt/granules/a.tif")
+
+    definition = cog_mosaic()
+    definition.cog = None
+    definition.granules = ["/opt/granules"]
+    result = MosaicManager(client).create(definition)
+
+    assert result.published
+    assert not pruned.called
+    assert "keeps its existing rows" in caplog.text
+
+
+@respx.mock
+def test_uploaded_files_are_re_sent_when_a_directory_is_reused(client, tmp_path):
+    granule = tmp_path / "20240303.tif"
+    granule.write_bytes(b"tiff")
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    config_present()
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    index_holds("/srv/data/imagery/s2/20240303.tif")
+
+    definition = cog_mosaic()
+    definition.granules = []
+    definition.upload_files = [granule]
+    result = MosaicManager(client).create(definition)
+
+    assert result.ok
+    # The configuration archive, then the granule-only harvest archive.
+    assert upload.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# A leftover index table with no directory: the fresh store is dead.  Once,
+# bootstrap a configuration from the table (UseExistingSchema) and build over it.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_create_bootstraps_a_config_over_a_leftover_table(client, caplog):
+    import io
+    import zipfile
+
+    from geoserver_mosaic import properties
+
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(404))
+    # No directory at first; after the bootstrap store ran, its config exists.
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(404))
+    bootstrapped = httpx.Response(200, text="Name=s2\nUseExistingSchema=true\n")
+    respx.get(CONFIG).mock(
+        # dead store: absent; bootstrap store: absent; real store: exists, then read
+        side_effect=[httpx.Response(404), httpx.Response(404), bootstrapped, bootstrapped]
+    )
+    patched = respx.put(CONFIG).mock(return_value=httpx.Response(201))
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    harvest = respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    publish = respx.post(f"{STORE}/coverages").mock(
+        side_effect=[
+            httpx.Response(500, text="The specified coverageName is unavailable"),
+            httpx.Response(201),  # the bootstrap store
+            httpx.Response(201),  # the real one
+        ]
+    )
+    drop = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    pruned = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    index_holds(*COG_GRANULES, "s3://bucket/old.tif")
+
+    result = MosaicManager(client).create(cog_mosaic())
+
+    assert result.ok and result.created
+    assert drop.call_count == 2
+    assert all("purge" not in c.request.url.params for c in drop.calls)
+    # dead store, bootstrap store, real store
+    assert upload.call_count == 3
+    with zipfile.ZipFile(io.BytesIO(upload.calls[1].request.content)) as archive:
+        bootstrap = properties.loads(archive.read("indexer.properties").decode())
+    assert bootstrap["UseExistingSchema"] == "true"
+    with zipfile.ZipFile(io.BytesIO(upload.calls[2].request.content)) as archive:
+        final = properties.loads(archive.read("indexer.properties").decode())
+    assert final["UseExistingSchema"] == "false"
+    written = properties.loads(patched.calls.last.request.content.decode())
+    assert written["UseExistingSchema"] == "false"
+    # 2 dead-store harvests + 1 bootstrap probe + 2 real harvests
+    assert harvest.call_count == 5
+    assert publish.call_count == 3
+    assert pruned.calls.last.request.url.params["filter"] == "location IN ('s3://bucket/old.tif')"
+    assert "left behind" in caplog.text
+
+
+@respx.mock
+def test_bootstrap_failure_names_the_table_to_drop(client, caplog):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    store_absent()
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(
+        return_value=httpx.Response(500, text="The specified coverageName is unavailable")
+    )
+    respx.delete(STORE).mock(return_value=httpx.Response(200))
+
+    with pytest.raises(GeoServerHTTPError):
+        MosaicManager(client).create(cog_mosaic())
+    assert "drop table 's2'" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Deleting cleanly
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_delete_empties_the_index_and_keeps_the_directory(client):
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}.json").mock(
+        return_value=httpx.Response(200, json={"coverageStore": {"url": "file:data/imagery/s2"}})
+    )
+    respx.get(f"{STORE}/coverages.json").mock(
+        return_value=httpx.Response(200, json={"coverages": {"coverage": [{"name": "s2"}]}})
+    )
+    emptied = respx.delete(f"{STORE}/coverages/s2/index/granules").mock(return_value=httpx.Response(200))
+    drop = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    rmdir = respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+
+    assert MosaicManager(client).delete("imagery", "s2") is True
+    assert emptied.calls.last.request.url.params["filter"] == "INCLUDE"
+    assert "purge" not in drop.calls.last.request.url.params
+    assert not rmdir.called
+
+
+@respx.mock
+def test_delete_can_remove_the_directory_on_request(client):
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}.json").mock(
+        return_value=httpx.Response(200, json={"coverageStore": {"url": "file:data/imagery/s2"}})
+    )
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={"coverages": ""}))
+    respx.delete(STORE).mock(return_value=httpx.Response(200))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    rmdir = respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+
+    MosaicManager(client).delete("imagery", "s2", remove_directory=True)
+    assert rmdir.called
+
+
+@respx.mock
+def test_delete_workspace_deletes_each_store_first(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(f"{BASE}/workspaces/imagery/coveragestores.json").mock(
+        return_value=httpx.Response(200, json={"coverageStores": {"coverageStore": [{"name": "s2"}]}})
+    )
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    respx.get(f"{STORE}.json").mock(
+        return_value=httpx.Response(200, json={"coverageStore": {"url": "file:data/imagery/s2"}})
+    )
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={"coverages": ""}))
+    respx.delete(STORE).mock(return_value=httpx.Response(200))
+    ws = respx.delete(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+
+    assert MosaicManager(client).delete_workspace("imagery") is True
+    assert ws.calls.last.request.url.params["recurse"] == "true"
+
+
+@respx.mock
+def test_external_store_replace_never_touches_the_data_directory(client):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    probe = respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    config = respx.get(CONFIG).mock(return_value=httpx.Response(200, text="Name=m\n"))
+    respx.delete(STORE).mock(return_value=httpx.Response(200))
+    respx.put(f"{STORE}/external.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    MosaicManager(client).create(external_mosaic(mosaic_name="m"), replace=True)
+
+    assert not probe.called and not config.called
+
+
+@respx.mock
+def test_an_explicit_purge_500_with_the_store_gone_is_tolerated(client, caplog):
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(side_effect=[httpx.Response(200), httpx.Response(404)])
+    respx.get(f"{STORE}/coverages.json").mock(return_value=httpx.Response(200, json={"coverages": ""}))
+    respx.delete(STORE).mock(return_value=httpx.Response(500, text="Unable to drop the database: "))
+    respx.get(CONFIG).mock(return_value=httpx.Response(404))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(404))
+    index_holds(*COG_GRANULES)
+    respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.post(f"{STORE}/remote.imagemosaic").mock(return_value=httpx.Response(202))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+
+    result = MosaicManager(client).create(cog_mosaic(), replace=True, purge="metadata")
+
+    assert result.created
+    assert "the store is gone" in caplog.text
+
+
+@respx.mock
+def test_shapefile_indexed_replace_starts_from_a_fresh_directory(client, tmp_path):
+    """An emptied shapefile index cannot be harvested into; the directory goes."""
+    granule = tmp_path / "20240303.tif"
+    granule.write_bytes(b"tiff")
+    respx.get(f"{BASE}/workspaces/imagery").mock(return_value=httpx.Response(200))
+    respx.get(STORE).mock(return_value=httpx.Response(200))
+    listing = respx.get(f"{STORE}/coverages.json")
+    drop = respx.delete(STORE).mock(return_value=httpx.Response(200))
+    respx.get(STORE_DIR).mock(return_value=httpx.Response(200))
+    rmdir = respx.delete(STORE_DIR).mock(return_value=httpx.Response(200))
+    config = respx.get(CONFIG).mock(return_value=httpx.Response(200, text="Name=s2\n"))
+    upload = respx.put(f"{STORE}/file.imagemosaic").mock(return_value=httpx.Response(201))
+    respx.get(f"{STORE}/coverages/s2").mock(return_value=httpx.Response(404))
+    respx.post(f"{STORE}/coverages").mock(return_value=httpx.Response(201))
+    index_holds("/srv/data/imagery/s2/20240303.tif")
+
+    definition = MosaicDefinition(workspace="imagery", store="s2", upload_files=[granule])
+    result = MosaicManager(client).create(definition, replace=True)
+
+    assert result.ok
+    assert not listing.called  # nothing to empty: the index goes with the directory
+    assert drop.called and rmdir.called
+    assert not config.called
+    assert upload.call_count == 1  # the archive carries the files; no re-send

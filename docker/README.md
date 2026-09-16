@@ -44,8 +44,8 @@ pieces individually:
 | Target | Does |
 |---|---|
 | `make check` | Server version, and which COG plugins actually installed |
-| `make driver` | Builds all three demo mosaics, recreating any that exist |
-| `make mosaic WHICH=remote` | Builds just one (`local`, `remote` or `upload`) |
+| `make driver` | Builds all four demo mosaics, recreating any that exist |
+| `make mosaic WHICH=remote` | Builds just one (`local`, `remote`, `upload` or `external`) |
 | `make inspect` | Granule counts and WMS preview URLs for what exists |
 | `make integration` | The pytest integration suite against the running stack |
 | `make clean-gs` | Deletes the demo workspace, leaving the containers up |
@@ -112,6 +112,12 @@ compose network. So:
 | `PG_HOST_FROM_GEOSERVER` | `postgis` | GeoServer |
 | `S3_BASE_FROM_GEOSERVER` | `http://localstack:4566/mosaic-tiles` | GeoServer |
 | `GRANULE_DIR_IN_GEOSERVER` | `/opt/granules` | GeoServer |
+| `PG_SCHEMA` | `gs2` or `gs3` (from `GS`) | GeoServer |
+
+`PG_SCHEMA` keeps the two servers' index tables apart: they share one PostGIS,
+and replacing a mosaic empties its index table. `make up*` creates both schemas
+(`make pg-schemas` on its own does too); set `PG_SCHEMA` explicitly when you run
+the driver outside `make`.
 
 Putting `localhost` in the last three is the classic failure: the store is
 created successfully and every granule then fails to harvest, because GeoServer
@@ -343,11 +349,38 @@ layer come back. Verified: after both a `restart` and a full `down`/`up`, the
 layer rendered identically with every granule still indexed. Only
 `make clean-volumes` (`down -v`) discards data.
 
+**`s3://` granules harvest with 202 but the index stays empty, after the
+mosaic previously used the HTTP reader.** The store directory survived the
+store, and the `<store>.properties` GeoServer wrote there still names the HTTP
+range reader; it outranks the new `indexer.properties`. `create(replace=True)`
+now removes that directory through the resource API, and a plain `create()`
+removes an orphaned one. The driver's verification reports the granules as
+failed rather than harvested, so this no longer passes silently.
+
+**A new store harvests everything with 202 and indexes nothing**, and
+publishing fails with `The specified coverageName is unavailable`. An index
+table of the same name already existed in PostGIS, left behind by an earlier
+store, and its directory is gone too (`make clean` keeps directories for
+exactly this reason). `create()` recovers by itself: it bootstraps a
+configuration from the table with a `UseExistingSchema=true` store, then builds
+the real store over it, logging a warning. On 3.0 the same state shows up as
+harvest `500`s with a `bounds is null` NullPointerException instead of silent
+202s. If the leftover table is *empty* there is no REST-only recovery; drop it.
+
+**Never pass `purge` for a PostGIS-indexed mosaic.** GeoServer implements it by
+trying to `DROP DATABASE` — the PostgreSQL log shows `database "gis" is being
+accessed by other users` each time — and when no other connection is open it
+succeeds: during development the whole `gis` database was dropped and
+re-created bare, which took the `gs2`/`gs3` schemas with it and made every
+PostGIS-indexed mosaic fail with `bounds is null` until `make pg-schemas` put
+them back. Nothing in the library or the driver sends `purge` unless asked.
+
 **`500 Failed to create reader from file:data/...`.** The store's data
 directory and its index have got out of step — typically because one was
 removed without the other. This does not happen on a restart; it happens when a
 store is deleted and recreated under the same name, or when the index table is
-dropped while the store directory survives. Use a fresh store name, or
+dropped while the store directory survives. `create(replace=True)` handles the
+directory side; if you got here by other means, use a fresh store name, or
 remove `<data_dir>/data/<workspace>/<store>` in the container and drop the
 PostGIS index table:
 

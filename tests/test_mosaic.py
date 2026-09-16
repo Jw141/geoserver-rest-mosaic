@@ -12,6 +12,7 @@ from geoserver_mosaic import (
     PostgisIndex,
     TimeRegex,
     build_config_archive,
+    build_granule_archive,
     properties,
 )
 
@@ -136,3 +137,35 @@ def test_names_default_to_the_store_name():
     definition = MosaicDefinition(workspace="w", store="s")
     assert definition.resolved_coverage() == "s"
     assert definition.resolved_mosaic_name() == "s"
+
+
+def test_granule_archive_holds_only_the_files(tmp_path):
+    granule = tmp_path / "a.tif"
+    granule.write_bytes(b"tiff")
+    with zipfile.ZipFile(io.BytesIO(build_granule_archive([granule]))) as zf:
+        assert zf.namelist() == ["a.tif"]
+
+
+def test_external_location_rejects_config_it_cannot_deliver():
+    definition = cog_time_mosaic(location="/data/mosaic/", granules=())
+    with pytest.raises(MosaicConfigurationError, match="cannot be applied") as info:
+        definition.validate()
+    # Every offending field is named, so the fix is one edit.
+    for name in ("index", "cog", "time_regex"):
+        assert name in str(info.value)
+
+
+def test_external_location_with_only_layer_metadata_is_valid():
+    MosaicDefinition(
+        workspace="w", store="s", location="/data/mosaic/", title="t", srs="EPSG:3857"
+    ).validate()
+
+
+def test_external_location_must_be_on_the_geoserver_host():
+    with pytest.raises(MosaicConfigurationError, match="GeoServer host"):
+        MosaicDefinition(workspace="w", store="s", location="s3://bucket/mosaic/").validate()
+
+
+def test_external_location_derives_no_dimensions_by_default():
+    definition = MosaicDefinition(workspace="w", store="s", location="/data/mosaic/")
+    assert definition.resolved_dimensions() == {}

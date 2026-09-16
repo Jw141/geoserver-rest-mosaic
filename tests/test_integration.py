@@ -57,19 +57,18 @@ def manager(client):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def clean_workspace(client):
-    """Start from a clean slate, and leave one behind on the way out."""
+def clean_workspace(manager):
+    """Start from a clean slate, and leave one behind on the way out.
+
+    Through the manager, so each store's directory and index table go with
+    it; a bare recursive workspace delete leaves both behind, and the next
+    store of the same name then indexes nothing.  Granule files are kept.
+    """
     import driver
 
-    def drop() -> None:
-        if client.workspace_exists(driver.WORKSPACE):
-            # recurse drops the stores and layers too; granule files are never
-            # purged, so the fixtures survive.
-            client.delete_workspace(driver.WORKSPACE, recurse=True)
-
-    drop()
+    manager.delete_workspace(driver.WORKSPACE)
     yield
-    drop()
+    manager.delete_workspace(driver.WORKSPACE)
 
 
 def test_server_is_a_supported_version(client):
@@ -96,26 +95,72 @@ def test_cog_modules_are_installed(label, pattern, client):
     )
 
 
-@pytest.mark.parametrize("which", ["local", "remote", "upload"])
+def expected_fixtures() -> tuple[int, set[str]]:
+    """Granule count and distinct dates in the fixtures directory.
+
+    Derived rather than hardcoded: ``make fixtures-add`` and ``fixtures-scatter``
+    grow the directory, and the mosaic must reflect whatever is there.
+    """
+    import re
+
+    import driver
+
+    names = driver.granule_names()
+    dates = {m.group(0)[:8] for m in (re.search(driver.TIME_REGEX.regex, n) for n in names) if m}
+    return len(names), dates
+
+
+# "external" registers the directory the "upload" case unpacked into, so it
+# must come after it -- which parametrize order guarantees.
+CASES = ["local", "remote", "upload", "external"]
+
+
+@pytest.mark.parametrize("which", CASES)
 def test_mosaic_is_created_and_indexed(which, client, manager, settings):
     import driver
+
+    if which == "external" and not client.coverage_store_exists(driver.WORKSPACE, "tiles-upload"):
+        pytest.skip("the external case reuses the upload store's directory")
 
     definition = driver.BUILDERS[which](settings)
     result = manager.create(definition, replace=True)
 
     assert not result.failed, result.failed
     assert result.published, "coverage was not published"
+    assert result.created
 
+    count, dates = expected_fixtures()
     granules = list(client.iter_granules(result.workspace, result.store, result.coverage))
-    assert len(granules) == 12, f"expected 12 granules, indexed {len(granules)}"
+    assert len(granules) == count, f"expected {count} granules, indexed {len(granules)}"
 
-    # Three timestamps, four spatial tiles each: the time dimension must have
-    # collapsed the tiles into three distinct instants.
-    times = {g["properties"]["time"] for g in granules}
-    assert len(times) == 3, times
+    # One instant per date, however many spatial tiles each has: the time
+    # dimension must have collapsed the tiles into distinct instants.
+    times = {g["properties"]["time"][:10].replace("-", "") for g in granules}
+    assert times == dates, times
 
 
-@pytest.mark.parametrize("which", ["local", "remote", "upload"])
+def test_rerunning_create_keeps_the_store_and_its_granules(client, manager, settings):
+    """A repeat create() must neither fail nor reconfigure nor duplicate.
+
+    GeoServer harvests a config ZIP uploaded to an existing mosaic instead of
+    applying it, so the second run has to take the harvest path deliberately.
+    The upload case is the sharpest test: its files are re-sent in full.
+    """
+    import driver
+
+    definition = driver.BUILDERS["upload"](settings)
+    before = manager.granule_count(definition)
+    assert before
+
+    result = manager.create(definition)
+
+    assert result.created is False
+    assert result.published
+    assert not result.failed
+    assert manager.granule_count(definition) == before
+
+
+@pytest.mark.parametrize("which", CASES)
 def test_mosaic_renders_through_wms(which, settings):
     import driver
 

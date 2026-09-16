@@ -62,7 +62,23 @@ def fake_geoserver(request: httpx.Request) -> httpx.Response:
     if path.endswith("/workspaces.json"):
         return httpx.Response(200, json={"workspaces": ""})
     if re.search(r"/index/granules\.json$", path):
+        # A by-name verification lookup (location IN (...)) is answered with
+        # exactly what it asked for, as a server that indexed everything would.
+        cql = request.url.params.get("filter", "")
+        if cql.startswith("location IN (") or cql.startswith("location LIKE "):
+            names = re.findall(r"'((?:[^']|'')*)'", cql)
+            # LIKE patterns arrive as '%/<name>'; answer with a plausible path.
+            features = [
+                {"properties": {"location": n.replace("''", "'").replace("%/", "/data/")}}
+                for n in names
+            ]
+            return httpx.Response(200, json={"features": features})
         return httpx.Response(200, json=GRANULE_FEATURES)
+    if path.endswith("/coverages.json"):
+        # The external case discovers the mosaic's native name from here.
+        if request.url.params.get("list") == "all":
+            return httpx.Response(200, json={"list": {"string": ["tiles-upload"]}})
+        return httpx.Response(200, json={"coverages": ""})
     if method == "GET":
         # Nothing exists yet, so every existence probe is a miss.
         return httpx.Response(404, text="not found")
@@ -85,9 +101,11 @@ def test_settings_default_to_compose_service_names(settings):
 def test_settings_read_the_environment(monkeypatch):
     monkeypatch.setenv("PG_HOST_FROM_GEOSERVER", "db.internal")
     monkeypatch.setenv("S3_BASE_FROM_GEOSERVER", "https://minio/bucket")
+    monkeypatch.setenv("PG_SCHEMA", "gs3")
     settings = driver.Settings.from_env(BASE)
     assert settings.pg_host == "db.internal"
     assert settings.s3_base == "https://minio/bucket"
+    assert settings.postgis_index().schema == "gs3"
 
 
 def test_wms_base_strips_the_rest_suffix():
@@ -127,6 +145,34 @@ def test_upload_mosaic_ships_files_rather_than_locations(settings, fixtures):
     definition = driver.upload_mosaic(settings)
     assert definition.granules == ()
     assert len(definition.upload_files) == 2
+
+
+def test_external_mosaic_registers_the_upload_stores_directory(settings, fixtures):
+    definition = driver.external_mosaic(settings)
+    assert definition.location == "/opt/geoserver/data_dir/data/mosaic-demo/tiles-upload/"
+    assert "time" in definition.dimensions  # not derivable, so declared
+
+
+@respx.mock
+def test_external_run_registers_the_directory_without_a_zip(settings, fixtures):
+    register = respx.put(
+        f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-external/external.imagemosaic"
+    ).mock(return_value=httpx.Response(201))
+    upload = respx.put(
+        f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-external/file.imagemosaic"
+    ).mock(return_value=httpx.Response(201))
+    publish = respx.post(
+        f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-external/coverages"
+    ).mock(return_value=httpx.Response(201))
+    respx.route().mock(side_effect=fake_geoserver)
+
+    assert driver.main(["--url", BASE, "external"]) == 0
+
+    assert register.calls.last.request.content == (
+        b"/opt/geoserver/data_dir/data/mosaic-demo/tiles-upload/"
+    )
+    assert not upload.called
+    assert "<nativeName>tiles-upload</nativeName>" in publish.calls.last.request.content.decode()
 
 
 def test_missing_fixtures_give_an_actionable_message(settings, tmp_path, monkeypatch):
@@ -200,7 +246,7 @@ def test_all_builds_every_mosaic(settings, fixtures, capsys):
     respx.route().mock(side_effect=fake_geoserver)
     assert driver.main(["--url", BASE, "all"]) == 0
     out = capsys.readouterr().out
-    for store in ("tiles-local", "tiles-remote", "tiles-upload"):
+    for store in ("tiles-local", "tiles-remote", "tiles-upload", "tiles-external"):
         assert f"mosaic-demo:{store}" in out
     assert "published  True" in out
     assert "index      2 granule(s)" in out
@@ -255,12 +301,42 @@ def test_a_failing_granule_makes_the_driver_exit_nonzero(settings, fixtures, cap
 
 
 @respx.mock
-def test_clean_deletes_the_workspace_recursively(settings):
+def test_clean_deletes_each_store_with_its_index_then_the_workspace(settings):
     respx.get(f"{REST}/workspaces/mosaic-demo").mock(return_value=httpx.Response(200))
+    respx.get(f"{REST}/workspaces/mosaic-demo/coveragestores.json").mock(
+        return_value=httpx.Response(
+            200, json={"coverageStores": {"coverageStore": [{"name": "tiles-local"}]}}
+        )
+    )
+    respx.get(f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-local").mock(
+        return_value=httpx.Response(200)
+    )
+    respx.get(f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-local.json").mock(
+        return_value=httpx.Response(
+            200, json={"coverageStore": {"name": "tiles-local", "url": "file:data/mosaic-demo/tiles-local"}}
+        )
+    )
+    respx.get(f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-local/coverages.json").mock(
+        return_value=httpx.Response(200, json={"coverages": {"coverage": [{"name": "tiles-local"}]}})
+    )
+    emptied = respx.delete(
+        f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-local/coverages/tiles-local/index/granules"
+    ).mock(return_value=httpx.Response(200))
+    store_delete = respx.delete(f"{REST}/workspaces/mosaic-demo/coveragestores/tiles-local").mock(
+        return_value=httpx.Response(200)
+    )
+    dir_delete = respx.delete(f"{REST}/resource/data/mosaic-demo/tiles-local").mock(
+        return_value=httpx.Response(200)
+    )
     delete = respx.delete(f"{REST}/workspaces/mosaic-demo").mock(
         return_value=httpx.Response(200)
     )
     assert driver.main(["--url", BASE, "clean"]) == 0
+    # Index emptied row by row, store deleted, directory kept, workspace last.
+    # Never a purge: on a PostGIS index GeoServer would try to drop the database.
+    assert emptied.called
+    assert "purge" not in store_delete.calls.last.request.url.params
+    assert not dir_delete.called
     assert delete.calls.last.request.url.params["recurse"] == "true"
 
 

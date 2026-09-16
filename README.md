@@ -8,11 +8,13 @@ A Python client for GeoServer's REST API, focused on creating and maintaining
 - **Remote COGs** — `http(s)://`, `s3://`, `gs://`, Azure — via the COG range readers
 - **Local-to-GeoServer files** harvested by path, no upload needed
 - **Uploaded files** for granules that live on the client machine
+- **Pre-provisioned mosaic directories** on the GeoServer host, registered as they stand
 - Time dimensions driven by a filename regex
+- Safe to re-run: an existing store is harvested into, never silently misconfigured
 
 ```bash
 uv sync --extra dev --extra examples   # or: pip install -e '.[dev,examples]'
-uv run pytest                          # 126 unit tests, no server needed
+uv run pytest                          # 200 unit tests, no server needed
 ```
 
 There is a full local test stack — GeoServer 2.28 **and** 3.0, PostGIS, and
@@ -78,6 +80,15 @@ therefore does this, which works for every granule location:
    mosaic, creating the index table and coverage.
 3. **`POST` the coverage** explicitly, with dimensions and reader parameters.
 
+**When the store already exists**, step 1 is skipped rather than repeated.
+GeoServer has no REST route that reconfigures an ImageMosaic in place, and a
+config ZIP `PUT` to an existing mosaic is interpreted as *granules to harvest*
+— the `.properties` files in it are ignored. So a repeat `create()` keeps the
+store's configuration, harvests `granules` and `upload_files` into it (the
+reader skips locations it already holds), and refreshes the coverage metadata.
+`MosaicResult.created` tells you which path was taken. To change index, COG or
+regex settings, pass `replace=True`.
+
 The generated `indexer.properties` looks like this:
 
 ```properties
@@ -103,6 +114,39 @@ Three cases, distinguished by *where the file is*:
 | On the client machine | `upload_files=[Path("a.tif")]` | Packed into the configuration ZIP |
 
 They can be mixed in one definition.
+
+### A mosaic directory that is already configured
+
+The three cases above all have this client write the configuration. The fourth
+is a directory on the GeoServer host that **already is** a mosaic — it holds its
+own `indexer.properties` (and `datastore.properties`, `timeregex.properties`,
+maybe a shapefile index), provisioned by ops, a migration, or an earlier
+GeoServer. Register it as it stands with `location`:
+
+```python
+MosaicDefinition(
+    workspace="imagery",
+    store="archive",
+    location="/srv/mosaics/archive/",       # as the GeoServer process sees it
+    dimensions={"time": time_dimension()},  # declared, not derived: see below
+    title="Archive",
+)
+```
+
+The store is created with `PUT external.imagemosaic` and rooted at that
+directory; the coverage's native name is discovered from the server (or pinned
+with `mosaic_name` when the directory exposes several). Because the
+configuration lives outside GeoServer's data directory and cannot be delivered
+over REST, `index`, `cog`, `time_regex`, `indexer`, `upload_files` and
+`extra_files` are rejected in this mode, and the time dimension is not derived
+— declare it in `dimensions`. `replace=True` re-registers the store and leaves
+the directory's index alone, since the directory owns it.
+
+Two things learned against 2.28.4: the body has to be a **plain path** — the
+`file:` URL form in GeoServer's own docs is answered with `400 Failed to locate
+the input file` for a directory that exists (a `file:` URL passed in is reduced
+to a path for you) — and the native name has to be asked for with `list=all`,
+because `list=available` came back empty for the freshly registered store.
 
 ## PostGIS indexing
 
@@ -133,10 +177,12 @@ To point several mosaics at one pre-existing granule table, set
 ```python
 mosaics = MosaicManager(gs)
 
-# Add granules as new imagery lands.
+# Add granules as new imagery lands: by location GeoServer can reach ...
 harvested, failed = mosaics.add_granules(
     "imagery", "sentinel2", ["s3://tiles/S2_20240303T104018.tif"],
 )
+# ... or by uploading files from this machine into the existing mosaic.
+mosaics.add_files("imagery", "sentinel2", [Path("S2_20240304T104015.tif")])
 
 # Page through the index (mosaics can hold millions of granules).
 for granule in gs.iter_granules("imagery", "sentinel2", "sentinel2"):
@@ -166,25 +212,72 @@ For the docker stack that means `make down` / `make up` are safe; only
 `make clean-volumes` (`down -v`) discards anything, and it says so.
 
 Cleanup is only relevant when **deleting a store and recreating it under the
-same name** — re-provisioning, not restarting:
+same name** — re-provisioning, not restarting. GeoServer keeps two things beyond
+the catalog entry, and the REST API can only partly reach them:
 
-- `create(..., replace=True)` empties the granule index before dropping the
-  store, so the new mosaic does not inherit granules from the old one. Deleting
-  a store leaves its index behind, and stale rows would otherwise inflate the
-  granule count while the build still reported success.
-- Two cases it cannot fix over REST. **A stale store directory** gives
-  `500 Failed to create reader from file:data/...`; use a fresh store name or
-  remove `<data_dir>/data/<workspace>/<store>` on the host. **An orphaned index
-  table** — the store was deleted by other means, its table left behind — is
-  adopted by the new mosaic. Both come from the store directory and the index
-  disagreeing, which is what happens if one is removed without the other.
+- **The store's directory** (`data/<workspace>/<store>`) of a PostGIS-indexed
+  mosaic holds the mosaic configuration GeoServer derived at first use
+  (`<name>.properties`). That file
+  outranks a freshly uploaded `indexer.properties` — a mosaic switched from the
+  HTTP to the S3 range reader silently kept using HTTP, with every harvest
+  acknowledged and nothing indexed, until this was found. It is also what lets
+  a re-created store work over its old index table at all: without it, the
+  reader tries to create the table, finds it, and never indexes anything
+  (verified with a brand-new store name and a pre-created table). So
+  `create(replace=True)` **keeps the directory** and **patches that file in
+  place** through the resource API with the definition's settings before
+  creating the store again. GeoServer's own derived keys (envelope, levels) are
+  left as they are. A shapefile-indexed mosaic keeps its index *in* that
+  directory, and an emptied shapefile index cannot be harvested into again, so
+  there the directory is removed and the store starts from scratch.
+- **The PostGIS index table** cannot be dropped from here. The only REST route,
+  `purge`, makes GeoServer attempt to **drop the whole database** — the
+  `500 Unable to drop the database` it usually answers with is that attempt
+  failing because other connections exist, and during development it succeeded
+  once and took every schema with it. Nothing in this library sends `purge`
+  unless you pass it; don't, for a PostGIS-indexed mosaic. Instead `replace`
+  **empties the index row by row** before deleting the store, and the new store
+  harvests into the same table. To change the index *schema*, drop the table in
+  the database or use a new `mosaic_name`.
+
+`MosaicManager.delete()` and `delete_workspace()` follow the same rules: empty
+the index, delete the store, keep the directory (`remove_directory=True` if the
+name will not come back — and then drop the table too). A bare
+`DELETE .../workspaces/x?recurse=true` leaves the index full and the directory
+in place; `create()` copes with that as well:
+
+- A leftover directory *with* a configuration is patched and reused. Stale rows
+  are pruned once the new granules are verified, when every one of them names a
+  single granule (`location IN (...)`, batched); after a directory harvest or an
+  upload they cannot be told apart and are kept, with a warning.
+- A leftover table *without* a directory is the hard case: the fresh store is
+  dead on arrival (publishing fails with `The specified coverageName is
+  unavailable`). `create()` handles it once by bootstrapping a configuration —
+  a store with `UseExistingSchema=true` initialises from the table's rows and
+  can be published, though harvesting into it inserts nothing — then deletes
+  that store and builds the real one over the directory it left. An *empty*
+  leftover table cannot be recovered over REST; the error says which table to
+  drop.
 
 `purge` follows GeoServer's own vocabulary, `"none"` / `"metadata"` / `"all"`;
 booleans are accepted and mapped. It is not a boolean on the wire — sending
 `purge=false` is rejected with a bare 400. `purge="all"` deletes granule files,
-so never use it on granules you need to keep, and note that on a PostGIS-indexed
-mosaic GeoServer answers it with a 500 (`Unable to drop the database`) even
-though it does drop the store.
+so never use it on granules you need to keep. On a PostGIS-indexed mosaic
+either purge makes GeoServer try to drop the database (see above); if you pass
+one anyway and get the `500`, `create(replace=True)` checks that the store is
+gone and carries on.
+
+## Harvest results are verified, not trusted
+
+GeoServer acknowledges every harvest `POST` with `202` and an empty body — a
+key that does not exist, an unreachable bucket and a misconfigured range reader
+all look identical to success on the wire. `create()` therefore consults the
+index after publishing: locations that name one granule are looked up by name
+in batches (`location IN (...)`, so the cost scales with the batch, not the
+index), and a directory harvest or an uploaded file is checked for having
+produced a non-empty index. Anything missing moves from `result.harvested` to
+`result.failed` with a message pointing at the server log. Pass `verify=False`
+to skip it; `verify_granules(definition, locations)` runs it on its own.
 
 ## Empty mosaics
 
@@ -261,7 +354,7 @@ make smoke             # check + build all three mosaics + report
 `http://localhost:8080/geoserver/web` is the UI.
 
 `make smoke` chains `check`, `driver` and `inspect`. `make mosaic WHICH=remote`
-builds a single one. `make help` lists everything and shows the targeted server.
+builds a single one (`local`, `remote`, `upload` or `external`). `make help` lists everything and shows the targeted server.
 
 `make up-gs3` runs GeoServer 3.0 on :8081, and `make up-all` runs both side by
 side — pointing the driver at each in turn is the compatibility check. Add
@@ -272,13 +365,23 @@ make smoke GS=3
 ```
 
 [`examples/driver.py`](examples/driver.py) is the worked example as well as the
-smoke test. It builds three mosaics, one per granule location:
+smoke test. It builds four mosaics, one per granule location:
 
 | Command | Granules | Index |
 |---|---|---|
 | `driver.py local` | On the GeoServer host, harvested by directory | PostGIS |
 | `driver.py remote` | COGs pulled from LocalStack S3 over HTTP | PostGIS |
 | `driver.py upload` | Shipped from this machine in the config ZIP | Shapefile |
+| `driver.py external` | The directory `upload` left in the data dir, registered as is | The directory's own |
+
+The `external` case depends on `upload` having run first, which `all` and the
+integration suite guarantee. Index tables go in a PostGIS schema per server
+(`gs2` / `gs3`, created by `make up*` and selectable with `PG_SCHEMA`): the two
+containers share one database, and replacing a mosaic empties its index table,
+which must not pull the rug from under the other server's mosaic of the same
+name. Running the driver **without** `--replace` is the
+idempotency check: every store is reported with `created False`, re-harvested,
+and the granule counts do not change.
 
 `make fixtures` generates the granules it uses: 12 real COGs — a 2x2 grid at 3
 timestamps, tiled with overviews — so the mosaic genuinely stitches and the time

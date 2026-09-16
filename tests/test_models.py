@@ -49,6 +49,16 @@ def test_indexer_rejects_time_attribute_missing_from_schema():
         indexer.validate()
 
 
+def test_indexer_schema_check_matches_whole_attribute_names():
+    # "time" is a substring of "datetime" but not an attribute of this schema.
+    indexer = IndexerConfig(
+        name="m", schema="*the_geom:Polygon,location:String,datetime:java.util.Date"
+    )
+    with pytest.raises(MosaicConfigurationError, match="TimeAttribute"):
+        indexer.validate()
+    assert indexer.attributes() == ["the_geom", "location", "datetime"]
+
+
 def test_indexer_requires_location_attribute():
     indexer = IndexerConfig(
         name="m", schema="*the_geom:Polygon", time_attribute=None
