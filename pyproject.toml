@@ -1,0 +1,33 @@
+[project]
+name = "geoserver-rest-mosaic"
+version = "0.1.0"
+description = "GeoServer REST client focused on ImageMosaic layers (PostGIS index, local + remote COG granules)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "respx>=0.21",
+]
+# Only needed to generate the demo granules; the library itself has no
+# geospatial dependencies.
+examples = [
+    "rasterio>=1.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/geoserver_mosaic"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs the docker-compose stack (deselect with -m 'not integration')",
+]

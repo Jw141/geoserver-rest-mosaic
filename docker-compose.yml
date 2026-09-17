@@ -1,0 +1,148 @@
+# Test stack for geoserver-rest-mosaic.
+#
+#   docker compose --profile gs2 up -d      # GeoServer 2.28.4 on :8080
+#   docker compose --profile gs3 up -d      # GeoServer 3.0.0  on :8081
+#   docker compose --profile all up -d      # both, to compare versions
+#
+# postgis and localstack carry no profile, so they start with any of the above.
+#
+# GeoServer here is the Kartoza image, which can install the COG community
+# plugins at startup: `cog-http-plugin` provides the HTTP range reader and
+# `cog-s3-plugin` the S3 one.  Both are requested through COMMUNITY_EXTENSIONS
+# below, and configured through the IIO_ variables in the shared environment
+# block -- imageio-ext's namespace, not the AWS SDK's.
+#
+# Hostname note: inside this network the services are reachable as `postgis`,
+# `localstack` and `geoserver*`.  From your shell they are on localhost at the
+# published ports.  Granule URLs and index connection details are resolved by
+# *GeoServer*, not by the client, so they must use the container names -- see
+# .env.example.
+
+name: geoserver-mosaic
+
+x-geoserver-common: &geoserver-common
+  restart: unless-stopped
+  depends_on:
+    postgis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  environment: &geoserver-env
+    GEOSERVER_ADMIN_USER: ${GEOSERVER_USER:-admin}
+    GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_PASSWORD:-geoserver}
+    GEOSERVER_DATA_DIR: /opt/geoserver/data_dir
+    # Kartoza sizes the JVM with these rather than raw JAVA_OPTS.
+    INITIAL_MEMORY: ${GS_INITIAL_MEMORY:-512M}
+    MAXIMUM_MEMORY: ${GS_MAXIMUM_MEMORY:-2G}
+    # Skip the demo layers and the Tomcat manager apps: faster boot, less noise
+    # in the catalog listings the driver prints.
+    SAMPLE_DATA: "false"
+    TOMCAT_EXTRAS: "false"
+    ENABLE_JSONP: "true"
+    # COG support ships as four independent community packages, one per
+    # connection type: cog-http, cog-s3, cog-azure, cog-google.  Kartoza names
+    # them with the `-plugin` suffix used by the release artifacts.
+    # Do NOT add azure or google alongside s3: GeoServer's docs warn the cloud
+    # providers' dependencies interfere with each other.
+    STABLE_EXTENSIONS: ${GS_STABLE_EXTENSIONS:-}
+    COMMUNITY_EXTENSIONS: ${GS_COMMUNITY_EXTENSIONS:-cog-http-plugin,cog-s3-plugin}
+    # The S3 range reader is imageio-ext's, not the AWS SDK's default chain, so
+    # it reads IIO_-prefixed variables and ignores AWS_ACCESS_KEY_ID and
+    # friends.  The segment after IIO_ is the *URL scheme*: granules addressed
+    # as s3://bucket/key are configured by IIO_S3_*.  IIO_S3_AWS_ENDPOINT is
+    # what redirects them at LocalStack instead of real AWS.
+    IIO_S3_AWS_ENDPOINT: http://localstack:4566
+    IIO_S3_AWS_USER: ${AWS_ACCESS_KEY_ID:-test}
+    IIO_S3_AWS_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-test}
+    IIO_S3_AWS_REGION: ${AWS_REGION:-us-east-1}
+    # LocalStack and MinIO address buckets by path (host/bucket/key); the AWS
+    # SDK defaults to virtual-host style (bucket.host/key), which never resolves
+    # against them.  Defaults to false upstream, so it must be set explicitly.
+    IIO_S3_AWS_FORCE_PATH_STYLE: ${IIO_S3_AWS_FORCE_PATH_STYLE:-true}
+    # Connection pooling for the HTTP range reader; raise if a large mosaic
+    # saturates it.  These are global, not per-scheme.
+    IIO_HTTP_MAX_REQUESTS: ${IIO_HTTP_MAX_REQUESTS:-128}
+    IIO_HTTP_MAX_REQUESTS_PER_HOST: ${IIO_HTTP_MAX_REQUESTS_PER_HOST:-16}
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf -o /dev/null http://localhost:8080/geoserver/web/ || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 40
+    # First boot downloads and installs the extensions before serving.
+    start_period: 240s
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-gis}
+      POSTGRES_USER: ${PG_USER:-gis}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-gis}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-gis} -d ${PG_DATABASE:-gis}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  localstack:
+    # Pinned deliberately, and this tag is verified working: from 2026-03-23 the
+    # `latest` image requires a LOCALSTACK_AUTH_TOKEN even for community
+    # services like S3, while tags published before that need none.  3.x closed
+    # long before the change, so `3` is stable and token-free.  If you do have a
+    # token (the free tier issues them), set it in .env and you can move
+    # LOCALSTACK_VERSION forward.
+    image: localstack/localstack:${LOCALSTACK_VERSION:-3}
+    restart: unless-stopped
+    environment:
+      # List form, so LOCALSTACK_AUTH_TOKEN is passed through only when it is
+      # actually set -- an empty value reads as a bad token rather than none.
+      - SERVICES=s3
+      - PERSISTENCE=0
+      - MOSAIC_BUCKET=${S3_BUCKET:-mosaic-tiles}
+      - LOCALSTACK_AUTH_TOKEN
+    ports:
+      - "${S3_PORT:-4566}:4566"
+    volumes:
+      # Seeded on container ready; re-run with `make seed-s3` after
+      # regenerating fixtures.
+      - ./docker/localstack/ready.d:/etc/localstack/init/ready.d:ro
+      # Mounted at the same path as on the host, so the two never drift.
+      - ./fixtures/tiles:/fixtures/tiles:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls s3://${S3_BUCKET:-mosaic-tiles} >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  geoserver2:
+    <<: *geoserver-common
+    profiles: ["gs2", "all"]
+    image: kartoza/geoserver:${GS2_VERSION:-2.28.4}
+    ports:
+      - "${GS2_PORT:-8080}:8080"
+    volumes:
+      # Granules "local to the GeoServer host". Read-only: harvesting only reads
+      # them, the index lives in PostGIS.
+      - ./fixtures/tiles:/opt/granules:ro
+      - geoserver2-data:/opt/geoserver/data_dir
+
+  geoserver3:
+    <<: *geoserver-common
+    profiles: ["gs3", "all"]
+    image: kartoza/geoserver:${GS3_VERSION:-3.0.0}
+    ports:
+      - "${GS3_PORT:-8081}:8080"
+    volumes:
+      - ./fixtures/tiles:/opt/granules:ro
+      - geoserver3-data:/opt/geoserver/data_dir
+
+volumes:
+  postgis-data:
+  geoserver2-data:
+  geoserver3-data:
